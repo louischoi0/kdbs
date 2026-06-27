@@ -3,6 +3,7 @@
 #include <linux/kds_page.h>
 #include <linux/kds_page_mgr.h>
 #include <linux/kds_page_alloc.h>
+#include <linux/kds_meta.h>
 #include <linux/compiler.h>
 #include <linux/bug.h>
 #include <linux/errno.h>
@@ -193,27 +194,107 @@ static void btree_node_insert_at(kds_btree_node_t *node, int pos,
 }
 
 /*
- * TODO -- BLOCKED: needs a "allocate a brand-new, empty logical page"
- * entry point in page_mgr.c.
+ * Allocates a fresh page_id (kds_meta.h's assign_page_id() -- the
+ * superblock-backed counter, the same one page_alloc.c uses for
+ * brand-new pages) and registers it in the buffer pool via
+ * kds_buf_alloc_new(). This is the "allocate a brand-new, empty
+ * logical page" primitive btree_split_node()/btree_propagate_split()
+ * previously had no way to reach -- now that kds_buf_alloc_new()
+ * exists in page_mgr.c, both functions below use it directly rather
+ * than going through page_alloc.c's pre-allocation ring (that ring
+ * hands out whichever id happens to be staged next; a btree split
+ * needs a specific, freshly-minted id it can address immediately as
+ * "the new sibling page", not an arbitrary one).
  *
- * kds_get_reserved_kpage() (and kds_page_alloc(), used elsewhere)
- * used to hand back a kds_page_t* for a freshly reserved page with
- * no disk read involved. kds_buf_lookup_or_load() does not cover
- * this -- it always reads existing on-disk content into the frame.
- * There is currently no page_mgr.c function that takes a free frame
- * and registers it for a *new* page_id without a prior
- * kds_read_logical_page() call.
- *
- * Until that allocator exists, this function cannot be correctly
- * migrated -- guessing at a workaround here (e.g. silently skipping
- * the disk read) would risk operating on uninitialized/stale buffer
- * contents. Returns -ENOSYS so callers fail loudly instead of
- * corrupting btree structure.
+ * Returns a pinned frame with its type already set and committed to
+ * the page's on-disk header bytes, or an ERR_PTR.
  */
+static kds_frame_t *btree_alloc_new_page(kds_page_type_t type)
+{
+    kds_page_id_t new_id = assign_page_id();
+    kds_frame_t *frame;
+
+    if (!new_id)
+        return ERR_PTR(-ENOMEM); /* assign_page_id() returns 0 only if the
+                                   * superblock isn't up yet -- treated as
+                                   * an allocation failure here. */
+
+    frame = kds_buf_alloc_new(new_id);
+    if (IS_ERR(frame))
+        return frame;
+
+    /*
+     * frame is exclusively ours at this point -- just allocated,
+     * not yet visible to any other cursor or traversal -- so setting
+     * its header directly without the content lock is safe, the
+     * same convention btree_init_root_kpage()/btree_init_data_kpage()
+     * already use below.
+     */
+    frame->kp->hdr.type = type;
+    frame->kp->hdr.flags |= KDS_PAGE_FLAG_INIT;
+    kds_commit_page_hdr(frame);
+
+    return frame;
+}
+
 static int btree_split_node(kds_btree_node_t *node, kds_btree_split_result_t *result)
 {
-    pr_warn("btree_split_node: blocked, no frame-based \"allocate new page\" API yet\n");
-    return -ENOSYS;
+    kds_frame_t *new_frame;
+    kds_btree_node_t new_node;
+    int mid = BTREE_MAX_KEYS / 2;
+    int i, j;
+
+    /* New sibling keeps whatever type the node being split has
+     * (ROOT/INTERNAL/DATA) -- matches the original pre-migration
+     * behavior of copying node->page->hdr.type verbatim. */
+    new_frame = btree_alloc_new_page(node->frame->kp->hdr.type);
+    if (IS_ERR(new_frame))
+        return PTR_ERR(new_frame);
+
+    memset(&new_node, 0, sizeof(kds_btree_node_t));
+    new_node.level = node->level;
+    new_node.frame = new_frame;
+    new_node.next = node->next;
+    new_node.prev = node->frame->kp->id;
+
+    result->promoted_key = node->keys[mid];
+    result->right_page_id = new_frame->kp->id;
+
+    for (i = mid + 1, j = 0; i < BTREE_MAX_KEYS; i++, j++) {
+        new_node.keys[j] = node->keys[i];
+        new_node.slots[j] = node->slots[i];
+    }
+    new_node.slots[j] = node->slots[BTREE_MAX_KEYS];
+    new_node.key_count = BTREE_MAX_KEYS - mid - 1;
+
+    node->key_count = mid;
+    node->next = new_frame->kp->id;
+
+    store_btree_node(node);
+    store_btree_node(&new_node);
+
+    if (new_node.next != 0) {
+        kds_frame_t *next_frame = kds_buf_lookup_or_load(new_node.next);
+
+        if (!IS_ERR(next_frame)) {
+            kds_btree_node_t next_node;
+
+            load_btree_node(next_frame, &next_node);
+            next_node.prev = new_frame->kp->id;
+            store_btree_node(&next_node);
+            kds_buf_unpin(next_frame);
+        } else {
+            pr_warn("btree_split_node: failed to relink next page %llu: %ld\n",
+                    new_node.next, PTR_ERR(next_frame));
+        }
+    }
+
+    kds_set_page_dirty(node->frame->kp);
+    kds_set_page_dirty(new_frame->kp);
+
+    kds_buf_unpin(new_frame);
+
+    return 0;
 }
 
 static int btree_propagate_split(kds_btree_cursor_t *cursor,
@@ -249,13 +330,49 @@ static int btree_propagate_split(kds_btree_cursor_t *cursor,
         *split_result = new_split;
     }
 
-    /*
-     * TODO -- BLOCKED: same "allocate a brand-new logical page" gap
-     * as btree_split_node() above (this path needs a fresh root
-     * page). See the comment there.
-     */
-    pr_warn("btree_propagate_split: blocked, no frame-based \"allocate new page\" API yet\n");
-    return -ENOSYS;
+    /* Every level was full and got split; we need a new root one
+     * level above the old one. */
+    {
+        kds_frame_t *new_root_frame;
+        kds_btree_node_t new_root;
+
+        new_root_frame = btree_alloc_new_page(KDS_PAGE_TYPE_BTREE_ROOT);
+        if (IS_ERR(new_root_frame))
+            return PTR_ERR(new_root_frame);
+
+        memset(&new_root, 0, sizeof(new_root));
+        new_root.level = cursor->nodes[0].level + 1;
+        new_root.frame = new_root_frame;
+        new_root.key_count = 1;
+        new_root.keys[0] = split_result->promoted_key;
+        new_root.slots[0] = cursor->nodes[0].frame->kp->id;
+        new_root.slots[1] = split_result->right_page_id;
+
+        /* Demote old root */
+        cursor->nodes[0].frame->kp->hdr.type = KDS_PAGE_TYPE_BTREE_INTERNAL;
+        kds_set_page_dirty(cursor->nodes[0].frame->kp);
+
+        store_btree_node(&new_root);
+        kds_set_page_dirty(new_root_frame->kp);
+
+        kds_buf_unpin(new_root_frame);
+
+        /*
+         * TODO: Update root page_id in metadata -- whatever points
+         * callers at "the root page for this btree" (e.g. a
+         * catalog row's desc_page_id, see catalog.c's
+         * kds_sys_table_t) must be updated to new_root_frame->kp->id
+         * now, or every future lookup will keep finding the old,
+         * now-demoted-to-INTERNAL root and never reach the real one.
+         * This was an unresolved TODO in the pre-migration version
+         * of this function too -- carried forward rather than
+         * guessed at here, since the right fix depends on the
+         * catalog layer (which table/index this btree belongs to),
+         * which this function has no way to know.
+         */
+    }
+
+    return 0;
 }
 
 int btree_insert(kds_page_id_t root_page_id, kds_tuple_id_t key,

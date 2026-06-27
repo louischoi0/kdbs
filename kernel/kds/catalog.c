@@ -183,8 +183,8 @@ static int bootstrap_one_catalog_page(kds_page_id_t page_id)
     return 0;
 }
 
-static int insert_sys_object_row(kd_oid_t oid, kd_oid_t namespace_oid,
-                                  kd_oid_t type_oid, const char *name)
+int kds_catalog_insert_object_row(kd_oid_t oid, kd_oid_t namespace_oid,
+                                   kd_oid_t type_oid, const char *name)
 {
     kds_frame_t *frame;
     kds_sys_object_t row = {0};
@@ -206,9 +206,9 @@ static int insert_sys_object_row(kd_oid_t oid, kd_oid_t namespace_oid,
     return ret;
 }
 
-static int insert_sys_table_row(kd_oid_t oid, kd_oid_t namespace_oid,
-                                 const char *name, kds_page_id_t desc_page_id,
-                                 kds_clustered_type_t clustered_type)
+int kds_catalog_insert_relation_row(kd_oid_t oid, kd_oid_t namespace_oid,
+                                     const char *name, kds_page_id_t desc_page_id,
+                                     kds_clustered_type_t clustered_type)
 {
     kds_frame_t *frame;
     kds_sys_table_t row = {0};
@@ -308,7 +308,7 @@ int kds_catalog_bootstrap(void)
 
     /* sys.objects rows for the four catalog tables themselves. */
     for (i = 0; i < ARRAY_SIZE(sys_tables); i++) {
-        ret = insert_sys_object_row(sys_tables[i].oid, KDS_OID_NAMESPACE_SYS,
+        ret = kds_catalog_insert_object_row(sys_tables[i].oid, KDS_OID_NAMESPACE_SYS,
                                      KDS_OID_TYPE_TABLE, sys_tables[i].name);
         if (ret) {
             pr_err("kds_catalog: failed to insert sys.objects row for %s: %d\n",
@@ -330,7 +330,7 @@ int kds_catalog_bootstrap(void)
         default:                        desc = 0; break;
         }
 
-        ret = insert_sys_table_row(sys_tables[i].oid, KDS_OID_NAMESPACE_SYS,
+        ret = kds_catalog_insert_relation_row(sys_tables[i].oid, KDS_OID_NAMESPACE_SYS,
                                     sys_tables[i].name, desc, KDS_CLUSTERED_HEAP);
         if (ret) {
             pr_err("kds_catalog: failed to insert sys.tables row for %s: %d\n",
@@ -420,13 +420,13 @@ int kds_catalog_create_table(kd_oid_t namespace_oid, const char *name,
 
     new_oid = kds_catalog_generate_user_oid();
 
-    ret = insert_sys_object_row(new_oid, namespace_oid, KDS_OID_TYPE_TABLE, name);
+    ret = kds_catalog_insert_object_row(new_oid, namespace_oid, KDS_OID_TYPE_TABLE, name);
     if (ret) {
         kds_buf_unpin(table_root);
         return ret;
     }
 
-    ret = insert_sys_table_row(new_oid, namespace_oid, name,
+    ret = kds_catalog_insert_relation_row(new_oid, namespace_oid, name,
                                 table_root->kp->id, clustered_type);
     if (ret) {
         kds_buf_unpin(table_root);
@@ -483,6 +483,43 @@ int kds_catalog_get_sys_table_row(kd_oid_t table_oid, kds_sys_table_t *out)
 
         if (row.oid == table_oid) {
             *out = row;
+            ret = 0;
+            break;
+        }
+    }
+
+    kds_buf_unpin(frame);
+    return ret;
+}
+
+int kds_catalog_find_table_oid_by_name(const char *name, kd_oid_t *out_oid)
+{
+    kds_frame_t *frame;
+    kds_heap_tuple_hdr_t hdr;
+    u16 nr_slots, slot;
+    int ret = -ENOENT;
+
+    if (!name || !out_oid)
+        return -EINVAL;
+
+    frame = kds_buf_lookup_or_load(KDS_CATALOG_PAGE_OBJECTS);
+    if (IS_ERR(frame))
+        return PTR_ERR(frame);
+
+    nr_slots = heap_nr_slots(frame);
+
+    for (slot = 0; slot < nr_slots; slot++) {
+        kds_sys_object_t row;
+        int r = heap_read_tuple(frame, slot, &hdr, &row, sizeof(row));
+
+        if (r == -ENOENT)
+            continue; /* dead slot, keep scanning */
+        if (r)
+            break;
+
+        if (row.type_oid == KDS_OID_TYPE_TABLE &&
+            !strncmp(row.name, name, KDS_CATALOG_NAME_MAX)) {
+            *out_oid = row.oid;
             ret = 0;
             break;
         }

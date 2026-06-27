@@ -9,7 +9,25 @@
 
 #define PRE_ALLOC_RING_BUFFER_SIZE 128
 
-void kds_init_page_alloc_system(void);
+/*
+ * Range-based id minting: rather than calling alloc_page_id_batch()
+ * (which bumps the superblock-persisted counter) for every single
+ * fresh page, the allocator keeps a standing contiguous range
+ * [alloc_point, alloc_point + remaining) it hands ids out of one at
+ * a time. When `remaining` drops below PRE_ALLOC_PAGE_THRES, a brand
+ * new range of PRE_ALLOC_NUM ids is minted; whatever was left of the
+ * old range is NOT discarded -- each of those leftover ids is pushed
+ * onto the freelist (the same one kds_add_kpage_freelist() feeds) so
+ * they get reused before the new range is touched.
+ *
+ * PRE_ALLOC_NUM must be larger than PRE_ALLOC_PAGE_THRES, or every
+ * single id draw would trigger another refill.
+ */
+#define PRE_ALLOC_NUM           256
+#define PRE_ALLOC_PAGE_THRES    32
+
+int kds_init_page_alloc_system(void);
+void kds_shutdown_page_alloc_system(void);
 
 /*
  * Returns a pinned, freshly-typed kds_frame_t* for a new logical
@@ -21,7 +39,15 @@ void kds_init_page_alloc_system(void);
 kds_frame_t *kds_get_reserved_kpage(kds_page_type_t type);
 kds_frame_t *kds_page_alloc(kds_page_type_t type);
 
-
+/*
+ * Returns a previously freed page_id to the allocator's freelist for
+ * future reuse. Deliberately takes a bare kds_page_id_t rather than
+ * a kds_page_t*  /kds_frame_t* -- by the time a page is freed, its
+ * frame may already be gone (evicted/reused), so the freelist must
+ * not hold a pointer into frame/page memory whose lifetime it
+ * doesn't own. Reusing a freed id is the allocator's job, not the
+ * buffer pool's.
+ */
 void kds_add_kpage_freelist(kds_page_id_t id);
 
 /*
@@ -30,7 +56,6 @@ void kds_add_kpage_freelist(kds_page_id_t id);
  * should go through kds_add_kpage_freelist(), not this struct,
  * directly.
  */
-
 typedef struct kds_free_page_node {
     kds_page_id_t       id;
     struct list_head    node;
@@ -40,6 +65,15 @@ typedef struct kds_page_allocator {
     u64                 reserved;
     u64                 cursor;
     kds_frame_t         *ring[PRE_ALLOC_RING_BUFFER_SIZE];
+
+    /* Standing id range -- see the PRE_ALLOC_NUM/PRE_ALLOC_PAGE_THRES
+     * comment above. Protected by range_lock, a separate lock from
+     * `lock` (ring bookkeeping) and `freelist_lock` (the id-reuse
+     * freelist) -- these are three independent concerns and none of
+     * them should serialize on the others. */
+    kds_page_id_t       alloc_point;
+    u64                 remaining;
+    spinlock_t          range_lock;
 
     struct list_head    freelist;
 

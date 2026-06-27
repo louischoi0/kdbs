@@ -225,8 +225,32 @@ int kds_catalog_create_table(kd_oid_t namespace_oid, const char *name,
  * ------------------------------------------------------------------ */
 
 int kds_catalog_get_sys_table_row(kd_oid_t table_oid, kds_sys_table_t *out);
+
+/*
+ * Scans sys.objects (disk, not the small in-memory well-known-object
+ * registry above -- kds_catalog_create_table() only writes the disk
+ * row, it does not register user tables in that in-memory array) for
+ * a row named `name` with type_oid == KDS_OID_TYPE_TABLE. Returns
+ * -ENOENT if no such table exists.
+ */
+int kds_catalog_find_table_oid_by_name(const char *name, kd_oid_t *out_oid);
+
 int kds_catalog_build_schema_from_columns(kd_oid_t rel_id, kds_schema_t *out_schema);
 int kds_catalog_init_table_access(kd_oid_t namespace_oid, kd_oid_t oid,
                                    kds_table_access_t *out);
+
+/*
+ * Lower-level row-insert primitives, exposed so kds_relation.h's
+ * index creation can reuse the exact same sys.objects/sys.tables row
+ * format kds_catalog_create_table() uses for ordinary tables --
+ * indexes are relations too (same pg_class-style unification
+ * PostgreSQL uses: an index is just another row in sys.tables with
+ * clustered_type btree and no sys.columns rows of its own).
+ */
+int kds_catalog_insert_object_row(kd_oid_t oid, kd_oid_t namespace_oid,
+                                   kd_oid_t type_oid, const char *name);
+int kds_catalog_insert_relation_row(kd_oid_t oid, kd_oid_t namespace_oid,
+                                     const char *name, kds_page_id_t desc_page_id,
+                                     kds_clustered_type_t clustered_type);
 
 #endif /* __KDS_CATALOG_H */

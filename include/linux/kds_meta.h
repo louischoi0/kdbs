@@ -36,7 +36,22 @@ typedef struct kds_superblock {
     atomic64_t      total_pages;
     atomic64_t      free_pages;
 
-    u8              reserved2[8120];
+    /*
+     * Page-id pre-allocation range, persisted ONLY at clean shutdown
+     * (kds_shutdown_page_alloc_system() -> kds_meta_set_alloc_range()
+     * + kds_superblock_fsync()) -- see that function's doc comment
+     * for why mid-range persistence would risk handing out the same
+     * page_id twice after an unclean shutdown. On an unclean
+     * shutdown (crash, force unload), these simply hold whatever the
+     * last clean shutdown left them as (or the zeroed boot default
+     * if there never was one), and the allocator mints a fresh range
+     * instead of trusting a stale in-flight one -- safe, at the cost
+     * of abandoning whatever range was active when it crashed.
+     */
+    kds_page_id_t   alloc_point;
+    u64             alloc_remaining;
+
+    u8              reserved2[8104];
 } __attribute__((packed)) kds_superblock_t;
 
 static_assert(sizeof(kds_superblock_t) == KDS_PAGE_SIZE,
@@ -94,6 +109,18 @@ int kds_superblock_fsync(void);
 void kds_init_proc_meta_ctx(void);
 
 /*
+ * Returns true if kds_init_meta_system() created a brand-new
+ * superblock this boot (invalid/missing magic), false if it loaded
+ * an existing one. Callers that bootstrap on-disk structures keyed
+ * off fixed page_ids (e.g. kds_catalog_bootstrap()) must check this
+ * before running -- the buffer pool starts empty every boot
+ * regardless of what's already on disk, so without this check a
+ * bootstrap routine that unconditionally (re)creates its fixed pages
+ * would silently wipe out existing data on every reboot.
+ */
+bool kds_meta_is_fresh_init(void);
+
+/*
  * Both take unsigned long* (not unsigned long) -- spin_lock_irqsave()
  * needs to write the saved IRQ flag back into the caller's local
  * variable, so the caller's `flags` must be passed by address:
@@ -110,5 +137,21 @@ void kds_init_proc_meta_ctx(void);
  */
 void lock_meta_superblock(unsigned long *flags);
 void unlock_meta_superblock(unsigned long *flags);
+
+/*
+ * Used by kds_page_alloc.c to resume its id pre-allocation range
+ * across a clean restart instead of always starting at (0, 0) and
+ * minting a brand-new range on first use. See the alloc_point/
+ * alloc_remaining field comment in kds_superblock_t above for the
+ * crash-safety reasoning behind only persisting these at clean
+ * shutdown.
+ *
+ * Neither function calls kds_superblock_fsync() itself -- the
+ * caller (kds_shutdown_page_alloc_system()) is responsible for that,
+ * since it knows when it's actually safe to persist (after it has
+ * stopped handing out any more ids from the range).
+ */
+void kds_meta_set_alloc_range(kds_page_id_t alloc_point, u64 remaining);
+void kds_meta_get_alloc_range(kds_page_id_t *out_alloc_point, u64 *out_remaining);
 
 #endif /* _KDS_META_H */

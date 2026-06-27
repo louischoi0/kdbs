@@ -32,7 +32,7 @@ static inline kds_heap_slot_t *heap_slot_ptr(void *page_addr, u16 idx)
                                 + (size_t)idx * sizeof(kds_heap_slot_t));
 }
 
-void heap_init_page(kds_frame_t *frame)
+void heap_init_page_as(kds_frame_t *frame, kds_page_type_t type)
 {
     void *addr;
     kds_heap_page_meta_t meta;
@@ -42,7 +42,7 @@ void heap_init_page(kds_frame_t *frame)
 
     kds_page_lock(frame->kp);
 
-    frame->kp->hdr.type = KDS_PAGE_TYPE_HEAP;
+    frame->kp->hdr.type = type;
     frame->kp->hdr.flags |= KDS_PAGE_FLAG_INIT;
 
     meta.nr_slots = 0;
@@ -56,6 +56,11 @@ void heap_init_page(kds_frame_t *frame)
     kunmap_local(addr);
 
     kds_page_unlock(frame->kp);
+}
+
+void heap_init_page(kds_frame_t *frame)
+{
+    heap_init_page_as(frame, KDS_PAGE_TYPE_HEAP);
 }
 
 u16 heap_free_space(kds_frame_t *frame)
@@ -98,8 +103,9 @@ u16 heap_nr_slots(kds_frame_t *frame)
     return meta.nr_slots;
 }
 
-int heap_insert_tuple(kds_frame_t *frame, const void *data, u16 data_len,
-                      u64 xmin, kds_heap_tid_t *out_tid)
+int heap_insert_tuple_ex(kds_frame_t *frame, const void *data, u16 data_len,
+                         u64 xmin, u64 xmax, u64 undo_ptr,
+                         kds_heap_tid_t *out_tid)
 {
     void *addr;
     kds_heap_page_meta_t meta;
@@ -138,8 +144,8 @@ int heap_insert_tuple(kds_frame_t *frame, const void *data, u16 data_len,
     new_slot_idx = meta.nr_slots;
 
     tuple_hdr.xmin = xmin;
-    tuple_hdr.xmax = 0;
-    tuple_hdr.undo_ptr = 0;
+    tuple_hdr.xmax = xmax;
+    tuple_hdr.undo_ptr = undo_ptr;
     tuple_hdr.data_len = data_len;
     tuple_hdr.flags = 0;
     tuple_hdr.reserved = 0;
@@ -166,6 +172,138 @@ int heap_insert_tuple(kds_frame_t *frame, const void *data, u16 data_len,
     out_tid->page_id = frame->kp->id;
     out_tid->slot = new_slot_idx;
 
+    return 0;
+}
+
+int heap_insert_tuple(kds_frame_t *frame, const void *data, u16 data_len,
+                      u64 xmin, kds_heap_tid_t *out_tid)
+{
+    return heap_insert_tuple_ex(frame, data, data_len, xmin, 0, 0, out_tid);
+}
+
+int heap_overwrite_tuple(kds_frame_t *frame, u16 slot_idx,
+                          const void *new_data, u16 new_data_len,
+                          u64 xmin, u64 xmax, u64 undo_ptr)
+{
+    void *addr;
+    kds_heap_page_meta_t meta;
+    kds_heap_slot_t slot;
+    kds_heap_tuple_hdr_t tuple_hdr;
+
+    if (!frame || !frame->kp || !frame->page)
+        return -EINVAL;
+
+    if (new_data_len > 0 && !new_data)
+        return -EINVAL;
+
+    kds_page_lock(frame->kp);
+
+    addr = kmap_local_page(frame->page);
+    memcpy(&meta, heap_meta_ptr(addr), KDS_HEAP_META_SIZE);
+
+    if (slot_idx >= meta.nr_slots) {
+        kunmap_local(addr);
+        kds_page_unlock(frame->kp);
+        return -ENOENT;
+    }
+
+    memcpy(&slot, heap_slot_ptr(addr, slot_idx), sizeof(slot));
+
+    if ((slot.flags & KDS_HEAP_SLOT_DEAD) || slot.length == 0) {
+        kunmap_local(addr);
+        kds_page_unlock(frame->kp);
+        return -ENOENT;
+    }
+
+    if ((u16)(KDS_HEAP_TUPLE_HDR_SIZE + new_data_len) > slot.length) {
+        kunmap_local(addr);
+        kds_page_unlock(frame->kp);
+        return -ENOSPC;
+    }
+
+    tuple_hdr.xmin = xmin;
+    tuple_hdr.xmax = xmax;
+    tuple_hdr.undo_ptr = undo_ptr;
+    tuple_hdr.data_len = new_data_len;
+    tuple_hdr.flags = 0;
+    tuple_hdr.reserved = 0;
+
+    memcpy((char *)addr + slot.offset, &tuple_hdr, KDS_HEAP_TUPLE_HDR_SIZE);
+    if (new_data_len > 0)
+        memcpy((char *)addr + slot.offset + KDS_HEAP_TUPLE_HDR_SIZE,
+               new_data, new_data_len);
+
+    kunmap_local(addr);
+
+    kds_set_page_dirty(frame->kp);
+    kds_page_unlock(frame->kp);
+
+    return 0;
+}
+
+int heap_retire_slot(kds_frame_t *frame, u16 slot_idx)
+{
+    void *addr;
+    kds_heap_page_meta_t meta;
+    kds_heap_slot_t slot;
+
+    if (!frame || !frame->kp || !frame->page)
+        return -EINVAL;
+
+    kds_page_lock(frame->kp);
+
+    addr = kmap_local_page(frame->page);
+    memcpy(&meta, heap_meta_ptr(addr), KDS_HEAP_META_SIZE);
+
+    if (slot_idx >= meta.nr_slots) {
+        kunmap_local(addr);
+        kds_page_unlock(frame->kp);
+        return -ENOENT;
+    }
+
+    memcpy(&slot, heap_slot_ptr(addr, slot_idx), sizeof(slot));
+
+    slot.flags |= KDS_HEAP_SLOT_DEAD;
+    slot.length = 0;
+    memcpy(heap_slot_ptr(addr, slot_idx), &slot, sizeof(slot));
+
+    kunmap_local(addr);
+
+    kds_set_page_dirty(frame->kp);
+    kds_page_unlock(frame->kp);
+
+    return 0;
+}
+
+int heap_slot_capacity(kds_frame_t *frame, u16 slot_idx, u16 *out_capacity)
+{
+    void *addr;
+    kds_heap_page_meta_t meta;
+    kds_heap_slot_t slot;
+
+    if (!frame || !frame->kp || !frame->page || !out_capacity)
+        return -EINVAL;
+
+    kds_page_lock(frame->kp);
+
+    addr = kmap_local_page(frame->page);
+    memcpy(&meta, heap_meta_ptr(addr), KDS_HEAP_META_SIZE);
+
+    if (slot_idx >= meta.nr_slots) {
+        kunmap_local(addr);
+        kds_page_unlock(frame->kp);
+        return -ENOENT;
+    }
+
+    memcpy(&slot, heap_slot_ptr(addr, slot_idx), sizeof(slot));
+
+    kunmap_local(addr);
+    kds_page_unlock(frame->kp);
+
+    if ((slot.flags & KDS_HEAP_SLOT_DEAD) || slot.length == 0)
+        return -ENOENT;
+
+    *out_capacity = slot.length - KDS_HEAP_TUPLE_HDR_SIZE;
     return 0;
 }
 

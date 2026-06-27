@@ -17,6 +17,12 @@
 
 kds_superblock_t *superblock = NULL;
 static DEFINE_SPINLOCK(superblock_lock);
+static bool g_fresh_init;
+
+bool kds_meta_is_fresh_init(void)
+{
+    return g_fresh_init;
+}
 
 /*
  * Dedicated I/O buffer for the superblock. kds_read_logical_page()/
@@ -37,6 +43,12 @@ static int init_superblock_and_fsync(kds_superblock_t *block)
 
     if (unlikely(!block || !sb_io_page))
         return -EINVAL;
+
+    /* vmalloc() does not zero memory -- without this, every field
+     * not explicitly set below (including the new alloc_point/
+     * alloc_remaining range-persistence fields) would start out
+     * holding whatever garbage was already in that memory. */
+    memset(block, 0, sizeof(*block));
 
     block->magic = SUPERBLOCK_MAGIC;
     block->version = KDS_VERSION;
@@ -70,6 +82,38 @@ void lock_meta_superblock(unsigned long *flags)
 void unlock_meta_superblock(unsigned long *flags)
 {
     spin_unlock_irqrestore(&superblock_lock, *flags);
+}
+
+void kds_meta_set_alloc_range(kds_page_id_t alloc_point, u64 remaining)
+{
+    unsigned long flags;
+
+    if (unlikely(!superblock))
+        return;
+
+    lock_meta_superblock(&flags);
+    superblock->alloc_point = alloc_point;
+    superblock->alloc_remaining = remaining;
+    unlock_meta_superblock(&flags);
+}
+
+void kds_meta_get_alloc_range(kds_page_id_t *out_alloc_point, u64 *out_remaining)
+{
+    unsigned long flags;
+
+    if (!out_alloc_point || !out_remaining)
+        return;
+
+    if (unlikely(!superblock)) {
+        *out_alloc_point = 0;
+        *out_remaining = 0;
+        return;
+    }
+
+    lock_meta_superblock(&flags);
+    *out_alloc_point = superblock->alloc_point;
+    *out_remaining = superblock->alloc_remaining;
+    unlock_meta_superblock(&flags);
 }
 
 int kds_superblock_fsync(void)
@@ -165,6 +209,8 @@ static int kds_load_or_init_superblock(void)
 
     pr_warn("KDS: Invalid superblock magic (0x%llx), initializing new one\n",
             superblock->magic);
+
+    g_fresh_init = true;
 
     ret = init_superblock_and_fsync(superblock);
     if (ret) {

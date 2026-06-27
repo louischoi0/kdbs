@@ -93,6 +93,36 @@ typedef struct kds_heap_tid {
     u16             slot;
 } kds_heap_tid_t;
 
+/*
+ * A tuple header's undo_ptr field is a plain u64 -- these pack/unpack
+ * a kds_heap_tid_t into/from that single field so an undo entry's
+ * location can be stamped directly into the tuple header it
+ * describes. page_id is assumed to fit in 48 bits (281 trillion
+ * pages -- not a real constraint in practice) leaving the top 16
+ * bits for the slot index. 0 is reserved to mean "no undo entry",
+ * matching page_id 0 never being a valid assigned page_id (see
+ * kds_meta.h's assign_page_id(), which starts counting from 1).
+ */
+static inline u64 kds_heap_tid_pack(kds_heap_tid_t tid)
+{
+    return (tid.page_id & 0xFFFFFFFFFFFFULL) | ((u64)tid.slot << 48);
+}
+
+static inline kds_heap_tid_t kds_heap_tid_unpack(u64 packed)
+{
+    kds_heap_tid_t tid;
+
+    tid.page_id = packed & 0xFFFFFFFFFFFFULL;
+    tid.slot = (u16)(packed >> 48);
+    return tid;
+}
+
+/* Initializes an empty page with the given page type (HEAP, or e.g.
+ * UNDO -- an undo page is physically just a heap page, see
+ * kds_undo.h). heap_init_page() below is a thin wrapper for the
+ * common KDS_PAGE_TYPE_HEAP case. */
+void heap_init_page_as(kds_frame_t *frame, kds_page_type_t type);
+
 /* Initializes an empty heap page: sets the common header's type to
  * KDS_PAGE_TYPE_HEAP and resets the heap metadata (nr_slots = 0,
  * lower/upper bracketing an empty free-space region). Does not write
@@ -116,10 +146,59 @@ u16 heap_nr_slots(kds_frame_t *frame);
  * inserting transaction's id) into the tuple header. On success,
  * *out_tid is filled with the new tuple's address and 0 is returned.
  * Returns -ENOSPC if there isn't enough free space, -EINVAL for bad
- * arguments.
+ * arguments. Equivalent to heap_insert_tuple_ex() with xmax=0,
+ * undo_ptr=0 (a brand-new, live tuple with no prior version).
  */
 int heap_insert_tuple(kds_frame_t *frame, const void *data, u16 data_len,
                       u64 xmin, kds_heap_tid_t *out_tid);
+
+/*
+ * Full-control insert: same as heap_insert_tuple() but lets the
+ * caller stamp xmax and undo_ptr directly at creation time. This is
+ * what the update path (kds_undo.h's kds_heap_update_tuple()) uses
+ * when it has to relocate a tuple to a new slot -- the new slot's
+ * undo_ptr needs to point at the just-written undo entry from the
+ * moment it's created, not patched in afterward.
+ */
+int heap_insert_tuple_ex(kds_frame_t *frame, const void *data, u16 data_len,
+                         u64 xmin, u64 xmax, u64 undo_ptr,
+                         kds_heap_tid_t *out_tid);
+
+/*
+ * Overwrites the tuple at `slot_idx` in place (same physical offset)
+ * with new header fields and new payload bytes. Used for the
+ * HOT-style update path: when new_data_len fits within the slot's
+ * existing reserved span (slot.length - KDS_HEAP_TUPLE_HDR_SIZE),
+ * the tuple can be updated without touching the slot directory or
+ * moving anything. Returns -ENOSPC if new_data_len doesn't fit in
+ * the existing reservation -- callers should fall back to
+ * heap_retire_slot() + heap_insert_tuple_ex() in that case.
+ */
+int heap_overwrite_tuple(kds_frame_t *frame, u16 slot_idx,
+                          const void *new_data, u16 new_data_len,
+                          u64 xmin, u64 xmax, u64 undo_ptr);
+
+/*
+ * Physically retires a slot: marks it dead and zeroes its length,
+ * unconditionally (no xmax bookkeeping). This is NOT the same
+ * operation as heap_delete_tuple() (a user-visible MVCC delete that
+ * keeps the tuple readable to older snapshots via xmax) -- this is
+ * used internally by the update-relocate path once a tuple's prior
+ * content has already been safely copied into an undo entry, so
+ * nothing needs to read this slot directly anymore (older snapshots
+ * reach the prior version through the new tuple's undo_ptr chain
+ * instead). The dead slot's bytes are not reclaimed/compacted; see
+ * the file-level note in kds_undo.h about why that's fine here.
+ */
+int heap_retire_slot(kds_frame_t *frame, u16 slot_idx);
+
+/*
+ * Returns the data capacity (slot.length - KDS_HEAP_TUPLE_HDR_SIZE)
+ * reserved for the tuple at `slot_idx`, i.e. the largest new payload
+ * heap_overwrite_tuple() could write there without relocating.
+ * Returns -ENOENT if the slot is dead or out of range.
+ */
+int heap_slot_capacity(kds_frame_t *frame, u16 slot_idx, u16 *out_capacity);
 
 /*
  * Copies a tuple's header and payload out of the page.
