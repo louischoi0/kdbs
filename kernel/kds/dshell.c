@@ -1,10 +1,14 @@
 #include <linux/kds.h>
 #include <linux/kds_dshell.h>
 #include <linux/kds_catalog.h>
+#include <linux/kds_types.h>
 #include <linux/kds_relation.h>
+#include <linux/kds_executor.h>
 #include <linux/kds_heap.h>
 #include <linux/kds_page_mgr.h>
+#include <linux/kds_page_alloc.h>
 #include <linux/kds_meta.h>
+#include <linux/kds_proc.h>
 
 #include <linux/kernel.h>
 #include <linux/string.h>
@@ -12,6 +16,11 @@
 #include <linux/printk.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
+#include <linux/kref.h>
+#include <linux/completion.h>
+#include <linux/sched.h>
+#include <linux/jiffies.h>
+#include <linux/vmalloc.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/err.h>
@@ -48,43 +57,20 @@
  * CRTB <table_name> <col_name>:<type> [<col_name>:<type> ...]
  *
  * Defines a new heap-clustered table in the public namespace.
- * Supported <type> values: int, varchar, char, bool (matching the
- * scalar types kds_catalog_bootstrap() registers in sys.types).
+ * <type> is any name registered in kds_types.h's type table
+ * (int8/int16/int32/int64/float/decimal/bool/varchar/char) --
+ * adding a new type there makes it usable here automatically, no
+ * change needed in this file.
  *
  * btree-clustered tables are deliberately not exposed here -- this
  * command exists to exercise and validate the heap page layer in
  * isolation first, per the current focus; clustered_type is hardcoded
  * to KDS_CLUSTERED_HEAP.
  *
- * Example: CRTB users id:int name:varchar active:bool
+ * Example: CRTB users id:int64 name:varchar active:bool
  */
-struct kds_dshell_type_entry {
-    const char  *name;
-    u32         type_val;
-    u32         len;
-};
-
-static const struct kds_dshell_type_entry kds_dshell_types[] = {
-    { "int",     0, sizeof(s64) },
-    { "varchar", 1, 0 },
-    { "char",    2, 0 },
-    { "bool",    3, sizeof(u8) },
-};
-
-static const struct kds_dshell_type_entry *kds_dshell_find_type(const char *name)
-{
-    u32 i;
-
-    for (i = 0; i < ARRAY_SIZE(kds_dshell_types); i++) {
-        if (!strcmp(kds_dshell_types[i].name, name))
-            return &kds_dshell_types[i];
-    }
-    return NULL;
-}
-
 static int kds_cmd_create_table(char **argv, int argc, char *out, size_t out_size)
 {
-    pr_info("kds cmd create table");
     const char  *table_name = argv[1];
     kds_schema_t *schema;
     kd_oid_t     new_oid;
@@ -112,7 +98,7 @@ static int kds_cmd_create_table(char **argv, int argc, char *out, size_t out_siz
         char *spec = argv[i];
         char *col_name;
         char *type_name;
-        const struct kds_dshell_type_entry *type;
+        const kds_type_desc_t *type;
         kds_sys_column_t *col;
 
         if (schema->nr_cols >= KDS_SCHEMA_MAX_COLUMNS) {
@@ -131,7 +117,7 @@ static int kds_cmd_create_table(char **argv, int argc, char *out, size_t out_siz
             return -EINVAL;
         }
 
-        type = kds_dshell_find_type(type_name);
+        type = kds_type_lookup_by_name(type_name);
         if (!type) {
             scnprintf(out, out_size, "ERR unknown column type '%s'\n", type_name);
             kfree(schema);
@@ -144,7 +130,7 @@ static int kds_cmd_create_table(char **argv, int argc, char *out, size_t out_siz
         strncpy(col->name, col_name, KDS_CATALOG_NAME_MAX - 1);
         col->name[KDS_CATALOG_NAME_MAX - 1] = '\0';
         col->type_val = type->type_val;
-        col->len = type->len;
+        col->len = type->fixed_len;
         col->notnull = true;
 
         schema->nr_cols++;
@@ -152,6 +138,23 @@ static int kds_cmd_create_table(char **argv, int argc, char *out, size_t out_siz
 
     if (schema->nr_cols == 0) {
         scnprintf(out, out_size, "ERR table must have at least one column\n");
+        kfree(schema);
+        return -EINVAL;
+    }
+
+    /*
+     * DB-wide constraint: the first column is always the table's
+     * primary key, and always int64. This is purely positional --
+     * there is no separate "is_pk" flag on kds_sys_column_t -- so
+     * enforcing it here, at the one place tables get defined, is
+     * what makes HeapPageInsertExec's duplicate-PK check (see
+     * kds_executor.h) able to assume "first 8 bytes = PK" for every
+     * heap table without any further bookkeeping.
+     */
+    if (schema->cols[0].type_val != KDS_TYPE_INT64) {
+        scnprintf(out, out_size,
+                  "ERR first column ('%s') must be the primary key and type int64\n",
+                  schema->cols[0].name);
         kfree(schema);
         return -EINVAL;
     }
@@ -173,14 +176,12 @@ static int kds_cmd_create_table(char **argv, int argc, char *out, size_t out_siz
 /*
  * Row encoding used by INRW/SELC below -- there is no general
  * StructuredTuple-style codec on the C side yet (unlike the Python
- * POC), so this is a minimal, self-describing format just for
- * exercising heap.c:
- *
- *   int     -> 8 bytes, s64, native endianness
- *   bool    -> 1 byte, 0 or 1
- *   varchar/char -> u16 length prefix + that many raw bytes (no
- *                   embedded NUL assumed; column value is whatever
- *                   the command-line token contained)
+ * POC), so this delegates per-column encode/decode entirely to
+ * kds_types.h's registry: fixed-width types (int8/16/32/64/float/
+ * decimal/bool) are stored back-to-back at their known fixed_len,
+ * no length prefix needed; variable-width types (varchar/char) get
+ * an explicit u16 length prefix ahead of their encoded bytes, same
+ * as before.
  *
  * KNOWN LIMITATIONS (deliberate, to keep this a heap.c validation
  * tool rather than a real access method):
@@ -202,39 +203,35 @@ static int kds_dshell_encode_row(const kds_schema_t *schema, char **argv,
     for (i = 0; i < schema->nr_cols; i++) {
         const kds_sys_column_t *col = &schema->cols[i];
         const char *val = argv[2 + i];
+        const kds_type_desc_t *desc = kds_type_lookup_by_val((kds_type_val_t)col->type_val);
+        u16 written_len;
+        int ret;
 
-        switch (col->type_val) {
-        case 0: { /* int */
-            s64 v;
-            int ret = kstrtos64(val, 10, &v);
+        if (!desc)
+            return -EINVAL;
 
-            if (ret || off + sizeof(v) > buf_size)
-                return -EINVAL;
-            memcpy(buf + off, &v, sizeof(v));
-            off += sizeof(v);
-            break;
-        }
-        case 3: { /* bool */
-            u8 v = (!strcmp(val, "1") || !strcmp(val, "true")) ? 1 : 0;
+        if (desc->fixed_len == 0) {
+            /* Variable length: u16 length prefix, then the encoded
+             * payload right after it. */
+            if (off + sizeof(u16) > buf_size)
+                return -ENOSPC;
 
-            if (off + sizeof(v) > buf_size)
-                return -EINVAL;
-            buf[off++] = v;
-            break;
-        }
-        default: { /* varchar / char */
-            size_t len = strlen(val);
-            u16 len16;
+            ret = desc->encode(val, buf + off + sizeof(u16),
+                                buf_size - off - sizeof(u16), &written_len);
+            if (ret)
+                return ret;
 
-            if (len > U16_MAX || off + sizeof(len16) + len > buf_size)
-                return -EINVAL;
-            len16 = (u16)len;
-            memcpy(buf + off, &len16, sizeof(len16));
-            off += sizeof(len16);
-            memcpy(buf + off, val, len);
-            off += len;
-            break;
-        }
+            memcpy(buf + off, &written_len, sizeof(u16));
+            off += sizeof(u16) + written_len;
+        } else {
+            if (off + desc->fixed_len > buf_size)
+                return -ENOSPC;
+
+            ret = desc->encode(val, buf + off, buf_size - off, &written_len);
+            if (ret)
+                return ret;
+
+            off += written_len; /* == desc->fixed_len, by the type's own contract */
         }
     }
 
@@ -251,52 +248,36 @@ static int kds_dshell_decode_row(const kds_schema_t *schema, const u8 *buf,
 
     for (i = 0; i < schema->nr_cols; i++) {
         const kds_sys_column_t *col = &schema->cols[i];
+        const kds_type_desc_t *desc = kds_type_lookup_by_val((kds_type_val_t)col->type_val);
+        u16 value_len;
+        int decoded;
+
+        if (!desc)
+            return -EINVAL;
 
         if (i > 0)
             n += scnprintf(out + n, out_size - n, ", ");
 
-        switch (col->type_val) {
-        case 0: { /* int */
-            s64 v;
-
-            if (off + sizeof(v) > buf_len)
+        if (desc->fixed_len == 0) {
+            if (off + sizeof(u16) > buf_len)
                 return -EINVAL;
-            memcpy(&v, buf + off, sizeof(v));
-            off += sizeof(v);
-            n += scnprintf(out + n, out_size - n, "%s=%lld", col->name, v);
-            break;
+            memcpy(&value_len, buf + off, sizeof(u16));
+            off += sizeof(u16);
+        } else {
+            value_len = desc->fixed_len;
         }
-        case 3: { /* bool */
-            u8 v;
 
-            if (off + sizeof(v) > buf_len)
-                return -EINVAL;
-            v = buf[off++];
-            n += scnprintf(out + n, out_size - n, "%s=%s", col->name,
-                            v ? "true" : "false");
-            break;
-        }
-        default: { /* varchar / char */
-            u16 len;
+        if ((u32)off + value_len > buf_len)
+            return -EINVAL;
 
-            if (off + sizeof(len) > buf_len)
-                return -EINVAL;
-            memcpy(&len, buf + off, sizeof(len));
-            off += sizeof(len);
+        n += scnprintf(out + n, out_size - n, "%s=", col->name);
 
-            if (off + len > buf_len)
-                return -EINVAL;
+        decoded = desc->decode(buf + off, value_len, out + n, out_size - n);
+        if (decoded < 0)
+            return decoded;
+        n += decoded;
 
-            n += scnprintf(out + n, out_size - n, "%s=", col->name);
-            if (n + len < out_size) {
-                memcpy(out + n, buf + off, len);
-                n += len;
-                out[n] = '\0';
-            }
-            off += len;
-            break;
-        }
-        }
+        off += value_len;
     }
 
     return n;
@@ -311,10 +292,9 @@ static int kds_cmd_insert_row(char **argv, int argc, char *out, size_t out_size)
     const char *table_name = argv[1];
     kd_oid_t oid;
     kds_relation_t *rel;
-    kds_frame_t *frame;
     u8 row_buf[KDS_DSHELL_ROW_MAX];
     u16 row_len;
-    kds_heap_tid_t tid;
+    kds_heap_insert_exec_t exec;
     int ret;
 
     ret = kds_catalog_find_table_oid_by_name(table_name, &oid);
@@ -350,24 +330,30 @@ static int kds_cmd_insert_row(char **argv, int argc, char *out, size_t out_size)
         return ret;
     }
 
-    frame = kds_buf_lookup_or_load(rel->root_page_id);
-    if (IS_ERR(frame)) {
-        ret = PTR_ERR(frame);
-        scnprintf(out, out_size, "ERR lookup_or_load failed: %d\n", ret);
+    /*
+     * HeapPageInsertExec owns the "page full -> allocate a new page
+     * and link it onto the chain" decision now -- this handler no
+     * longer touches kds_buf_lookup_or_load()/heap_insert_tuple()
+     * directly, matching the new executor layer's responsibility
+     * split (see kds_executor.h).
+     */
+    kds_heap_insert_exec_init(&exec, rel, row_buf, row_len, KDS_DSHELL_XID);
+
+    if (kds_exec_run(&exec.base) != KDS_EXEC_DONE) {
+        if (exec.base.ret == -EEXIST) {
+            scnprintf(out, out_size,
+                      "ERR duplicate primary key in '%s'\n", table_name);
+        } else {
+            scnprintf(out, out_size, "ERR insert failed: %d\n", exec.base.ret);
+        }
         kds_relation_close(rel);
-        return ret;
+        return exec.base.ret;
     }
 
-    ret = heap_insert_tuple(frame, row_buf, row_len, KDS_DSHELL_XID, &tid);
-    kds_buf_unpin(frame);
     kds_relation_close(rel);
 
-    if (ret) {
-        scnprintf(out, out_size, "ERR heap_insert_tuple failed: %d\n", ret);
-        return ret;
-    }
-
-    scnprintf(out, out_size, "OK inserted into '%s' at slot=%u\n", table_name, tid.slot);
+    scnprintf(out, out_size, "OK inserted into '%s' at page=%llu slot=%u\n",
+              table_name, (u64)exec.out_tid.page_id, exec.out_tid.slot);
     return 0;
 }
 
@@ -375,15 +361,25 @@ static int kds_cmd_insert_row(char **argv, int argc, char *out, size_t out_size)
  * SELC <table_name> -- scans and prints every live tuple in the
  * table's single heap page.
  */
+/*
+ * SELC <table_name> -- scans and prints every live tuple in the
+ * table's heap page chain: starts at the table's root page
+ * (kds_relation_t.root_page_id) and follows next_page_id (heap.h)
+ * forward until it hits 0 (end of chain). This is a full scan with
+ * no index of any kind -- there's no way to jump directly to a
+ * particular page, only to walk the whole chain start to finish.
+ */
 static int kds_cmd_scan_table(char **argv, int argc, char *out, size_t out_size)
 {
     const char *table_name = argv[1];
     kd_oid_t oid;
     kds_relation_t *rel;
-    kds_frame_t *frame;
-    u16 nr_slots, slot;
+    kds_page_id_t current_page_id;
+    u32 page_index = 0;
+    u32 total_slots = 0;
     int n;
     int ret;
+    bool truncated = false;
 
     ret = kds_catalog_find_table_oid_by_name(table_name, &oid);
     if (ret) {
@@ -404,42 +400,60 @@ static int kds_cmd_scan_table(char **argv, int argc, char *out, size_t out_size)
         return -EINVAL;
     }
 
-    frame = kds_buf_lookup_or_load(rel->root_page_id);
-    if (IS_ERR(frame)) {
-        ret = PTR_ERR(frame);
-        scnprintf(out, out_size, "ERR lookup_or_load failed: %d\n", ret);
-        kds_relation_close(rel);
-        return ret;
-    }
+    n = scnprintf(out, out_size, "OK ");
+    current_page_id = rel->root_page_id;
 
-    nr_slots = heap_nr_slots(frame);
-    n = scnprintf(out, out_size, "OK %u slot(s)\n", nr_slots);
+    while (current_page_id != 0 && !truncated) {
+        kds_frame_t *frame;
+        u16 nr_slots, slot;
 
-    for (slot = 0; slot < nr_slots; slot++) {
-        kds_heap_tuple_hdr_t hdr;
-        u8 row_buf[KDS_DSHELL_ROW_MAX];
-        int r;
-
-        r = heap_read_tuple(frame, slot, &hdr, row_buf, sizeof(row_buf));
-        if (r == -ENOENT)
-            continue; /* dead slot */
-        if (r)
-            break;
-
-        if ((size_t)n + 16 >= out_size) {
-            n += scnprintf(out + n, out_size - n, "...(truncated)\n");
-            break;
+        frame = kds_buf_lookup_or_load(current_page_id);
+        if (IS_ERR(frame)) {
+            n += scnprintf(out + n, out_size - n,
+                            "\nERR lookup_or_load(page %llu) failed: %ld\n",
+                            (u64)current_page_id, PTR_ERR(frame));
+            kds_relation_close(rel);
+            return PTR_ERR(frame);
         }
 
-        n += scnprintf(out + n, out_size - n, "  [%u] xmin=%llu xmax=%llu ",
-                        slot, hdr.xmin, hdr.xmax);
-        n += kds_dshell_decode_row(&rel->schema, row_buf, hdr.data_len,
-                                    out + n, out_size - n);
-        n += scnprintf(out + n, out_size - n, "\n");
+        nr_slots = heap_nr_slots(frame);
+
+        for (slot = 0; slot < nr_slots; slot++) {
+            kds_heap_tuple_hdr_t hdr;
+            u8 row_buf[KDS_DSHELL_ROW_MAX];
+            int r;
+
+            r = heap_read_tuple(frame, slot, &hdr, row_buf, sizeof(row_buf));
+            if (r == -ENOENT)
+                continue; /* dead slot */
+            if (r)
+                break;
+
+            if ((size_t)n + 16 >= out_size) {
+                n += scnprintf(out + n, out_size - n, "...(truncated)\n");
+                truncated = true;
+                break;
+            }
+
+            n += scnprintf(out + n, out_size - n,
+                            "\n  page=%llu [%u] xmin=%llu xmax=%llu ",
+                            (u64)current_page_id, slot, hdr.xmin, hdr.xmax);
+            n += kds_dshell_decode_row(&rel->schema, row_buf, hdr.data_len,
+                                        out + n, out_size - n);
+            total_slots++;
+        }
+
+        current_page_id = truncated ? 0 : heap_get_next_page_id(frame);
+        kds_buf_unpin(frame);
+        page_index++;
     }
 
-    kds_buf_unpin(frame);
     kds_relation_close(rel);
+
+    if (!truncated)
+        n += scnprintf(out + n, out_size - n,
+                        "\n%u row(s) across %u page(s)\n", total_slots, page_index);
+
     return 0;
 }
 
@@ -496,15 +510,42 @@ static int kds_cmd_show_meta(char **argv, int argc, char *out, size_t out_size)
     return 0;
 }
 
+/*
+ * PSTA -- dumps page-allocation status: the id allocator's standing
+ * range/ring/freelist (kds_page_alloc.c) and the buffer pool's frame
+ * occupancy (kds_page_mgr.c). Useful for debugging exactly the class
+ * of issue seen earlier (ring staged at 0, or never refilling).
+ */
+static int kds_cmd_show_page_alloc_status(char **argv, int argc, char *out, size_t out_size)
+{
+    kds_page_id_t alloc_point;
+    u64 alloc_remaining, ring_count, freelist_count;
+    u32 total_frames, free_frames, valid_frames;
+
+    kds_page_alloc_get_stats(&alloc_point, &alloc_remaining, &ring_count, &freelist_count);
+    kds_buf_pool_get_stats(&total_frames, &free_frames, &valid_frames);
+
+    scnprintf(out, out_size,
+              "OK allocator: alloc_point=%llu alloc_remaining=%llu "
+              "ring_staged=%llu freelist=%llu\n"
+              "   frame_pool: total=%u free=%u valid=%u loading=%u\n",
+              (u64)alloc_point, alloc_remaining, ring_count, freelist_count,
+              total_frames, free_frames, valid_frames,
+              total_frames - free_frames - valid_frames);
+
+    return 0;
+}
+
 /* ------------------------------------------------------------------
  * Command table -- see kds_dshell.h for how to add a new command.
  * ------------------------------------------------------------------ */
 
 static const kds_dshell_cmd_t kds_dshell_cmds[] = {
-    { "CRTB", kds_cmd_create_table, 3 },
-    { "INRW", kds_cmd_insert_row,   3 },
-    { "SELC", kds_cmd_scan_table,   2 },
-    { "META", kds_cmd_show_meta,    1 },
+    { "CRTB", kds_cmd_create_table,          3 },
+    { "INRW", kds_cmd_insert_row,            3 },
+    { "SELC", kds_cmd_scan_table,            2 },
+    { "META", kds_cmd_show_meta,             1 },
+    { "PSTA", kds_cmd_show_page_alloc_status, 1 },
 };
 
 #define KDS_DSHELL_CMD_COUNT \
@@ -575,10 +616,47 @@ typedef struct kds_dshell_client {
     size_t  resp_pos;
 } kds_dshell_client_t;
 
+/*
+ * A queued command request. Heap-allocated and refcounted (kref),
+ * NOT stack-allocated, for a specific reason: write() waits on
+ * req->done with a *timeout* (kds_dshell_write() below), and if that
+ * wait times out, write() must be able to give up and return without
+ * the kds_proc consumer (kds_dshell_proc_run()) crashing if it's
+ * already holding a pointer to req and is mid-way through filling in
+ * resp_buf. A stack-allocated struct would make that a use-after-
+ * return memory corruption bug the moment the timeout path returns
+ * while the consumer is still touching it.
+ *
+ * With kref: write() holds one reference, the queue (and whoever
+ * dequeues it) holds the other. Whichever side finishes last is the
+ * one that actually frees it -- safe regardless of which side gives
+ * up or finishes first.
+ */
+typedef struct kds_dshell_request {
+    struct kref         kref;
+    char                cmd_buf[DSHELL_LINE_MAX];
+    char                resp_buf[DSHELL_RESP_MAX];
+    struct completion   done;
+    struct list_head    queue_node;
+} kds_dshell_request_t;
+
+#define KDS_DSHELL_REQUEST_TIMEOUT_MS  5000
+
+static LIST_HEAD(kds_dshell_queue);
+static DEFINE_SPINLOCK(kds_dshell_queue_lock);
+
 static dev_t kds_dshell_devt;
 static struct cdev kds_dshell_cdev;
 static struct class *kds_dshell_class;
 static bool kds_dshell_inited;
+static kds_proc_t *kds_dshell_proc;
+
+static void kds_dshell_request_release(struct kref *kref)
+{
+    kds_dshell_request_t *req = container_of(kref, kds_dshell_request_t, kref);
+
+    kfree(req);
+}
 
 static int kds_dshell_open(struct inode *inode, struct file *filp)
 {
@@ -599,37 +677,138 @@ static int kds_dshell_release(struct inode *inode, struct file *filp)
 }
 
 /*
- * One write() = one command. Parses it and immediately dispatches,
- * leaving the formatted response staged in client->resp_buf for the
- * client's subsequent read() to pick up. The write() itself always
- * "succeeds" (returns the number of bytes consumed) even if the
- * command failed -- the failure is reported through the response
- * text and the handler's errno, not through write()'s return value,
- * since the command was successfully *received and dispatched*.
+ * Drains every request currently on the queue, running each one
+ * through the same parse+dispatch path the old synchronous write()
+ * handler used to run inline. This is what makes dshell command
+ * execution happen on the scheduler's terms (this function only
+ * runs when kds_proc_schedule() picks kds_dshell_proc, exactly like
+ * any other system proc) instead of directly in whatever process
+ * context called write().
+ *
+ * Drains the whole queue per call rather than capping how many
+ * requests it services -- simplest behavior, and fine for the
+ * expected dshell load (a debug/admin channel, not a hot data path).
+ * If this ever needs to yield mid-drain to be fairer to other system
+ * procs sharing the CPU, that's a straightforward follow-up (check
+ * an elapsed-time budget against slice_ns inside the loop).
+ */
+static kds_proc_result_t kds_dshell_proc_run(kds_proc_t *proc, u64 slice_ns)
+{
+    kds_dshell_request_t *req;
+    char *argv[DSHELL_MAX_ARGS];
+    int argc;
+
+    for (;;) {
+        spin_lock(&kds_dshell_queue_lock);
+        if (list_empty(&kds_dshell_queue)) {
+            spin_unlock(&kds_dshell_queue_lock);
+            break;
+        }
+        req = list_first_entry(&kds_dshell_queue, kds_dshell_request_t, queue_node);
+        /* list_del_init(), not list_del() -- kds_dshell_write()'s
+         * timeout path checks list_empty(&req->queue_node) to tell
+         * whether this request is still queued (and therefore safe
+         * for it to remove and reclaim itself) versus already
+         * dequeued here (in which case it must back off and leave
+         * req alone). list_del_init() is what makes that check mean
+         * what it needs to mean. */
+        list_del_init(&req->queue_node);
+        spin_unlock(&kds_dshell_queue_lock);
+
+        argc = kds_split_cmd(req->cmd_buf, argv, DSHELL_MAX_ARGS);
+        if (argc < 0) {
+            scnprintf(req->resp_buf, sizeof(req->resp_buf),
+                      "ERR failed to parse command\n");
+        } else {
+            __kds_dispatch_dshell_cmd(argv, argc, req->resp_buf, sizeof(req->resp_buf));
+        }
+
+        /* Signal completion before dropping the queue's reference --
+         * order doesn't actually matter for correctness here (kref
+         * guarantees req isn't freed until both sides have dropped
+         * their reference, regardless of order), but completing
+         * first means a waiter that's been timing out right at this
+         * instant has the best chance of seeing its real response
+         * instead of racing a timeout. */
+        complete(&req->done);
+        kref_put(&req->kref, kds_dshell_request_release);
+    }
+
+    return KDS_PROC_YIELD_RET;
+}
+
+/*
+ * Enqueues the command for kds_dshell_proc_run() to service on its
+ * own schedule, then blocks (with a bounded timeout, not forever)
+ * until that happens. write() itself does no command parsing or
+ * dispatch anymore -- it only builds the request and waits.
  */
 static ssize_t kds_dshell_write(struct file *filp, const char __user *ubuf,
                                  size_t len, loff_t *off)
 {
     kds_dshell_client_t *client = filp->private_data;
-    char *argv[DSHELL_MAX_ARGS];
-    int argc;
-    size_t n = min(len, sizeof(client->cmd_buf) - 1);
+    kds_dshell_request_t *req;
+    size_t n;
+    long wait_ret;
 
     if (!client)
         return -EINVAL;
 
-    if (copy_from_user(client->cmd_buf, ubuf, n))
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
+
+    n = min(len, sizeof(req->cmd_buf) - 1);
+
+    if (copy_from_user(req->cmd_buf, ubuf, n)) {
+        kfree(req);
         return -EFAULT;
-
-    client->cmd_buf[n] = '\0';
-
-    argc = kds_split_cmd(client->cmd_buf, argv, DSHELL_MAX_ARGS);
-    if (argc < 0) {
-        scnprintf(client->resp_buf, sizeof(client->resp_buf),
-                  "ERR failed to parse command\n");
-    } else {
-        __kds_dispatch_dshell_cmd(argv, argc, client->resp_buf, sizeof(client->resp_buf));
     }
+    req->cmd_buf[n] = '\0';
+
+    kref_init(&req->kref);          /* refcount = 1, this call's reference */
+    init_completion(&req->done);
+    INIT_LIST_HEAD(&req->queue_node);
+
+    kref_get(&req->kref);            /* refcount = 2, the queue/consumer's reference */
+    spin_lock(&kds_dshell_queue_lock);
+    list_add_tail(&req->queue_node, &kds_dshell_queue);
+    spin_unlock(&kds_dshell_queue_lock);
+
+    wait_ret = wait_for_completion_timeout(&req->done,
+                    msecs_to_jiffies(KDS_DSHELL_REQUEST_TIMEOUT_MS));
+
+    if (wait_ret == 0) {
+        /* Timed out. Try to cancel by removing it from the queue
+         * ourselves -- only safe if it's still sitting there
+         * untouched. */
+        bool still_queued;
+
+        spin_lock(&kds_dshell_queue_lock);
+        still_queued = !list_empty(&req->queue_node);
+        if (still_queued)
+            list_del_init(&req->queue_node);
+        spin_unlock(&kds_dshell_queue_lock);
+
+        if (still_queued) {
+            /* We successfully cancelled it -- drop the queue's
+             * reference ourselves, since kds_dshell_proc_run() will
+             * never see this request now. */
+            kref_put(&req->kref, kds_dshell_request_release);
+        }
+        /* Either way, do not touch req->resp_buf -- if it wasn't
+         * still queued, kds_dshell_proc_run() dequeued it sometime
+         * between our timeout firing and this check, and may be
+         * writing into it right now. */
+
+        scnprintf(client->resp_buf, sizeof(client->resp_buf),
+                  "ERR request timed out after %dms waiting for dshell scheduler\n",
+                  KDS_DSHELL_REQUEST_TIMEOUT_MS);
+    } else {
+        memcpy(client->resp_buf, req->resp_buf, sizeof(client->resp_buf));
+    }
+
+    kref_put(&req->kref, kds_dshell_request_release); /* drop this call's reference */
 
     client->resp_len = strnlen(client->resp_buf, sizeof(client->resp_buf));
     client->resp_pos = 0;
@@ -640,7 +819,6 @@ static ssize_t kds_dshell_write(struct file *filp, const char __user *ubuf,
 static ssize_t kds_dshell_read(struct file *filp, char __user *ubuf,
                                 size_t len, loff_t *off)
 {
-    pr_info("kds_dshell_read");
     kds_dshell_client_t *client = filp->private_data;
     size_t remaining;
     size_t n;
@@ -667,6 +845,41 @@ static const struct file_operations kds_dshell_fops = {
     .write   = kds_dshell_write,
     .read    = kds_dshell_read,
 };
+
+/*
+ * vzalloc(), not vmalloc() -- see page_alloc.c's
+ * __kds_create_proc_prealloc() for the NULL-pointer crash this
+ * exact mistake caused there. kds_proc_register() depends on
+ * fields it doesn't set itself (allowed_cpus, preferred_cpu, ...)
+ * starting out zeroed.
+ */
+static int kds_register_dshell_proc(void)
+{
+    int ret;
+
+    kds_dshell_proc = vzalloc(sizeof(kds_proc_t));
+    if (!kds_dshell_proc)
+        return -ENOMEM;
+
+    kds_dshell_proc->kind = KDS_PROC_SYSTEM;
+    kds_dshell_proc->name = "kds_dshell_proc";
+    kds_dshell_proc->static_prio = -1;
+    kds_dshell_proc->dynamic_prio = KDS_PROC_PRIORITY_SYSTEM_BACKGROUND;
+    kds_dshell_proc->run = kds_dshell_proc_run;
+    kds_dshell_proc->ctx = NULL;
+    kds_dshell_proc->state = KDS_PROC_STATE_READY;
+
+    ret = kds_proc_register(kds_dshell_proc);
+    if (ret) {
+        pr_err("kds_dshell: failed to register scheduler proc: %d\n", ret);
+        vfree(kds_dshell_proc);
+        kds_dshell_proc = NULL;
+        return ret;
+    }
+
+    pr_info("kds_dshell: scheduler proc registered\n");
+    return 0;
+}
 
 int kds_init_dshell_system(void)
 {
@@ -701,11 +914,23 @@ int kds_init_dshell_system(void)
         return ret;
     }
 
+    ret = kds_register_dshell_proc();
+    if (ret) {
+        class_destroy(kds_dshell_class);
+        kds_dshell_class = NULL;
+        cdev_del(&kds_dshell_cdev);
+        unregister_chrdev_region(kds_dshell_devt, 1);
+        return ret;
+    }
+
     dev = device_create(kds_dshell_class, NULL, kds_dshell_devt, NULL,
                          KDS_DSHELL_DEV_NAME);
     if (IS_ERR(dev)) {
         ret = PTR_ERR(dev);
         pr_err("kds_dshell: device_create failed: %d\n", ret);
+        kds_proc_unregister(kds_dshell_proc);
+        vfree(kds_dshell_proc);
+        kds_dshell_proc = NULL;
         class_destroy(kds_dshell_class);
         kds_dshell_class = NULL;
         cdev_del(&kds_dshell_cdev);
@@ -721,10 +946,46 @@ int kds_init_dshell_system(void)
 
 void kds_shutdown_dshell_system(void)
 {
+    kds_dshell_request_t *req, *tmp;
+    LIST_HEAD(local_queue);
+
     if (!kds_dshell_inited)
         return;
 
     device_destroy(kds_dshell_class, kds_dshell_devt);
+
+    /*
+     * Unregister the proc BEFORE draining the queue -- once this
+     * returns, the scheduler will never call kds_dshell_proc_run()
+     * again, so anything still on the queue at this point is
+     * guaranteed to stay untouched by it. Without this ordering, a
+     * concurrent schedule() on another CPU could still be draining
+     * the queue while we're also draining it below -- two drainers
+     * racing on the same list.
+     */
+    if (kds_dshell_proc) {
+        kds_proc_unregister(kds_dshell_proc);
+        vfree(kds_dshell_proc);
+        kds_dshell_proc = NULL;
+    }
+
+    /*
+     * Wake up any writer still blocked in wait_for_completion_timeout()
+     * with an explicit shutdown error, instead of making them wait
+     * out the full timeout during module removal.
+     */
+    spin_lock(&kds_dshell_queue_lock);
+    list_splice_init(&kds_dshell_queue, &local_queue);
+    spin_unlock(&kds_dshell_queue_lock);
+
+    list_for_each_entry_safe(req, tmp, &local_queue, queue_node) {
+        list_del_init(&req->queue_node);
+        scnprintf(req->resp_buf, sizeof(req->resp_buf),
+                  "ERR dshell shutting down\n");
+        complete(&req->done);
+        kref_put(&req->kref, kds_dshell_request_release);
+    }
+
     class_destroy(kds_dshell_class);
     cdev_del(&kds_dshell_cdev);
     unregister_chrdev_region(kds_dshell_devt, 1);

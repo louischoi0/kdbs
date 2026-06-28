@@ -66,6 +66,20 @@
  */
 #define KDS_OID_TYPE_CHAR           24
 
+/*
+ * Added alongside the kds_types.h type registry (int8/int16/int32/
+ * float/decimal). KDS_OID_TYPE_INT (12) is kept as-is and now also
+ * aliased as KDS_OID_TYPE_INT64, since kds_types.h's KDS_TYPE_INT64
+ * is what "int" meant historically here -- not renumbered, to avoid
+ * disturbing the existing oid.
+ */
+#define KDS_OID_TYPE_INT8           25
+#define KDS_OID_TYPE_INT16          26
+#define KDS_OID_TYPE_INT32          27
+#define KDS_OID_TYPE_FLOAT          28
+#define KDS_OID_TYPE_DECIMAL        29
+#define KDS_OID_TYPE_INT64          KDS_OID_TYPE_INT
+
 #define KDS_OID_SYS_TYPES_TABLE     100
 #define KDS_OID_SYS_OBJECTS_TABLE   110
 #define KDS_OID_SYS_COLUMNS_TABLE   111

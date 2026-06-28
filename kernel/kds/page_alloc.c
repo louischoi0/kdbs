@@ -427,7 +427,25 @@ int __kds_create_proc_prealloc(void)
 {
     int ret;
 
-    kds_prealloc_proc = vmalloc(sizeof(kds_proc_t));
+    /*
+     * vzalloc(), not vmalloc() -- vmalloc() does not zero memory.
+     * kds_proc_register() (kds_proc.c) relies on proc->allowed_cpus
+     * starting out as an all-zero cpumask (it checks
+     * cpumask_empty(&proc->allowed_cpus) to decide whether to
+     * initialize it to cpu_online_mask) and on proc->preferred_cpu
+     * being a sane default. Only kind/name/static_prio/
+     * dynamic_prio/run/ctx/state are set explicitly below --
+     * allowed_cpus, preferred_cpu, cpu, pid, and the timing fields
+     * are left for kds_proc_register() to fill in, which only works
+     * correctly if they start zeroed. With plain vmalloc(), they
+     * were garbage, which made kds_proc_register() skip the
+     * cpumask_copy() initialization and compute a garbage CPU index
+     * for the per-CPU runqueue lookup -- the actual cause of the
+     * NULL-pointer store fault inside kds_proc_register() (a
+     * spin_lock() on a wild per_cpu() pointer derived from that
+     * garbage index).
+     */
+    kds_prealloc_proc = vzalloc(sizeof(kds_proc_t));
     if (!kds_prealloc_proc) {
         pr_err("KDS: Failed to allocate meta process\n");
         return -ENOMEM;
@@ -580,4 +598,45 @@ void kds_shutdown_page_alloc_system(void)
     pr_info("kds_page_alloc: shutdown complete, persisted alloc range "
             "[%llu, %llu) for next boot\n",
             (u64)persist_point, (u64)(persist_point + persist_remaining));
+}
+
+void kds_page_alloc_get_stats(kds_page_id_t *out_alloc_point, u64 *out_alloc_remaining,
+                               u64 *out_ring_count, u64 *out_freelist_count)
+{
+    if (out_alloc_point)
+        *out_alloc_point = 0;
+    if (out_alloc_remaining)
+        *out_alloc_remaining = 0;
+    if (out_ring_count)
+        *out_ring_count = 0;
+    if (out_freelist_count)
+        *out_freelist_count = 0;
+
+    if (!g_alloc)
+        return;
+
+    lock_g_alloc_range();
+    if (out_alloc_point)
+        *out_alloc_point = g_alloc->alloc_point;
+    if (out_alloc_remaining)
+        *out_alloc_remaining = g_alloc->remaining;
+    unlock_g_alloc_range();
+
+    if (out_ring_count) {
+        lock_g_alloc();
+        *out_ring_count = kds_get_pre_alloc_count();
+        unlock_g_alloc();
+    }
+
+    if (out_freelist_count) {
+        struct kds_free_page_node *node;
+        u64 count = 0;
+
+        lock_g_alloc_freelist();
+        list_for_each_entry(node, &g_alloc->freelist, node)
+            count++;
+        unlock_g_alloc_freelist();
+
+        *out_freelist_count = count;
+    }
 }

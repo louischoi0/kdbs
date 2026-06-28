@@ -155,6 +155,36 @@ kds_frame_t *kds_buf_lookup(kds_page_id_t page_id);
  */
 kds_frame_t *kds_buf_lookup_or_load(kds_page_id_t page_id);
 
+/*
+ * Registers a brand-new, empty logical page at page_id without
+ * reading anything from disk. Use this for pages that don't exist
+ * on disk yet (e.g. a freshly split-off btree node, a new root) --
+ * kds_buf_lookup_or_load() is the wrong call for this because it
+ * always assumes the page already has valid on-disk content.
+ *
+ * Caller responsibility: page_id must already be reserved by
+ * whatever owns logical-page-id allocation (extent/free-space
+ * management) -- this function does not allocate or validate
+ * page_id itself, it only registers a frame for it. If page_id is
+ * already present in the buffer pool, this fails with -EEXIST
+ * rather than silently handing back the existing frame (unlike
+ * lookup_or_load's racing-loaders behavior, two callers asking to
+ * *allocate* the same new page_id indicates a bug upstream, not a
+ * benign race).
+ *
+ * The returned frame's buffer is zero-filled and its header is
+ * initialized to { type = KDS_PAGE_TYPE_INVALID, crc = 0,
+ * flags = ALLOC | INIT | DIRTY } -- callers are expected to set the
+ * real page type via e.g. btree_init_root_kpage()/
+ * btree_init_data_kpage() and then write their own data through
+ * kds_frame_get_write_ptr()/kds_set_page_buffer(). The DIRTY flag is
+ * set up front so the page is guaranteed to be flushed to disk even
+ * if the caller never touches the buffer again before eviction.
+ *
+ * Returns a pinned frame, or ERR_PTR(-ENOMEM/-ENOSPC/-EEXIST).
+ */
+kds_frame_t *kds_buf_alloc_new(kds_page_id_t page_id);
+
 /* Increment refcnt. Lookup functions already pin on success; call
  * this only when handing the frame to another context that will
  * unpin independently. */
@@ -211,6 +241,16 @@ void kds_frame_put_read_ptr(kds_frame_t *frame);
  * separate follow-up.
  */
 int kds_frame_flush(kds_frame_t *frame);
-kds_frame_t *kds_buf_alloc_new(kds_page_id_t page_id);
+
+/*
+ * Reports frame-pool occupancy: out_total is always
+ * KDS_BUF_NR_FRAMES, out_free is the count of frames currently in
+ * the free list, out_valid is the count currently registered in the
+ * page_id -> frame mapping (state == KDS_FRAME_VALID). The
+ * remainder (total - free - valid) is frames mid-load
+ * (KDS_FRAME_LOADING). All zero if the pool hasn't been initialized
+ * yet (kds_buf_pool_init() not called/failed).
+ */
+void kds_buf_pool_get_stats(u32 *out_total, u32 *out_free, u32 *out_valid);
 
 #endif /* _KDS_PAGE_MGR_H */

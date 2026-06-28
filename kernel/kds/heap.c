@@ -36,6 +36,7 @@ void heap_init_page_as(kds_frame_t *frame, kds_page_type_t type)
 {
     void *addr;
     kds_heap_page_meta_t meta;
+    kds_page_id_t no_next = 0;
 
     if (!frame || !frame->kp || !frame->page)
         return;
@@ -47,12 +48,16 @@ void heap_init_page_as(kds_frame_t *frame, kds_page_type_t type)
 
     meta.nr_slots = 0;
     meta.lower = KDS_HEAP_AREA_OFFSET;
-    meta.upper = KDS_PAGE_SIZE;
+    /* Stops short of KDS_PAGE_SIZE by sizeof(kds_page_id_t) --
+     * that tail is permanently reserved for the next_page_id link,
+     * never available to the slot/tuple free-space calculation. */
+    meta.upper = KDS_HEAP_NEXT_PAGE_OFFSET;
     meta.reserved = 0;
 
     addr = kmap_local_page(frame->page);
     memcpy(addr, &frame->kp->hdr, KDS_PAGE_HDR_SIZE);
     memcpy(heap_meta_ptr(addr), &meta, KDS_HEAP_META_SIZE);
+    memcpy((char *)addr + KDS_HEAP_NEXT_PAGE_OFFSET, &no_next, sizeof(no_next));
     kunmap_local(addr);
 
     kds_page_unlock(frame->kp);
@@ -304,6 +309,44 @@ int heap_slot_capacity(kds_frame_t *frame, u16 slot_idx, u16 *out_capacity)
         return -ENOENT;
 
     *out_capacity = slot.length - KDS_HEAP_TUPLE_HDR_SIZE;
+    return 0;
+}
+
+kds_page_id_t heap_get_next_page_id(kds_frame_t *frame)
+{
+    void *addr;
+    kds_page_id_t next_page_id;
+
+    if (!frame || !frame->kp || !frame->page)
+        return 0;
+
+    kds_page_lock(frame->kp);
+
+    addr = kmap_local_page(frame->page);
+    memcpy(&next_page_id, (char *)addr + KDS_HEAP_NEXT_PAGE_OFFSET, sizeof(next_page_id));
+    kunmap_local(addr);
+
+    kds_page_unlock(frame->kp);
+
+    return next_page_id;
+}
+
+int heap_set_next_page_id(kds_frame_t *frame, kds_page_id_t next_page_id)
+{
+    void *addr;
+
+    if (!frame || !frame->kp || !frame->page)
+        return -EINVAL;
+
+    kds_page_lock(frame->kp);
+
+    addr = kmap_local_page(frame->page);
+    memcpy((char *)addr + KDS_HEAP_NEXT_PAGE_OFFSET, &next_page_id, sizeof(next_page_id));
+    kunmap_local(addr);
+
+    kds_set_page_dirty(frame->kp);
+    kds_page_unlock(frame->kp);
+
     return 0;
 }
 

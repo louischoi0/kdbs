@@ -14,6 +14,13 @@
 #define KDS_EXT_DATA_PAGE       1
 #define META_SUPERBLOCK_SECTOR  2048
 #define DATA_PAGE_OFFSET        32
+/* Sectors occupied by one logical page (KDS_PAGE_SIZE / sector size).
+ * Any code converting a page_id to a disk sector MUST multiply by
+ * this -- using `id` directly as a sector delta (as the old
+ * kds_page_sector() in page.c/kds_page_mgr.c did) advances only 1
+ * sector per page_id instead of KDS_PAGE_SECTORS sectors, which
+ * makes consecutive pages overlap on disk by all but one sector. */
+#define KDS_PAGE_SECTORS        (KDS_PAGE_SIZE / KDS_BLKDEV_SECTOR_SIZE)
 typedef u64 kds_ext_id_t;
 typedef u64 kds_page_id_t;
 typedef u64 kds_ext_key_t;
@@ -25,24 +32,21 @@ typedef u64 kds_offset_t;
 typedef u64 kds_size_t;
 typedef u8  kds_tiny_t;
 typedef u64 kds_tuple_id_t;
-
 #define KDS_PAGE_TYPE_INVALID           0
 #define KDS_PAGE_TYPE_BTREE_ROOT        1
 #define KDS_PAGE_TYPE_BTREE_INTERNAL    2
 #define KDS_PAGE_TYPE_BTREE_DATA        3
 #define KDS_PAGE_TYPE_HEAP              4
-#define KDS_PAGE_TYPE_TOAST             5
-#define KDS_PAGE_TYPE_UNDO              6
-
+#define KDS_PAGE_TYPE_UNDO              5
+#define KDS_PAGE_TYPE_TOAST             6
+#define KDS_PAGE_TYPE_REL_TUPLE         7
 typedef u32 kds_page_type_t;
-
 typedef struct kds_page_hdr {
     kds_page_type_t     type;
     u32                 crc;
     kds_page_flag_t     flags;
     u8                  reserved1[32];
 } __attribute__((packed)) kds_page_hdr_t;
-
 #define KDS_PAGE_HDR_SIZE sizeof(kds_page_hdr_t)
 #define KDS_PAGE_FLAG_ALLOC     1
 #define KDS_PAGE_FLAG_INIT      2

@@ -69,11 +69,14 @@ static const struct rhashtable_params kds_buf_params = {
 };
 
 /* ------------------------------------------------------------------
- * sector mapping (mirrors page.c's kds_page_sector convention)
+ * sector mapping: page_id N starts at sector
+ * DATA_PAGE_OFFSET + N * KDS_PAGE_SECTORS -- each page_id step must
+ * advance by a full page's worth of sectors (KDS_PAGE_SECTORS), not
+ * by 1 sector, or consecutive pages overlap on disk.
  * ------------------------------------------------------------------ */
 static inline sector_t kds_page_sector(kds_page_id_t id)
 {
-    return (sector_t)((id + DATA_PAGE_OFFSET) << 9);
+    return (sector_t)(DATA_PAGE_OFFSET + id * KDS_PAGE_SECTORS);
 }
 
 /* ------------------------------------------------------------------
@@ -575,4 +578,49 @@ int kds_frame_flush(kds_frame_t *frame)
 
     kds_page_unlock(frame->kp);
     return 0;
+}
+
+void kds_buf_pool_get_stats(u32 *out_total, u32 *out_free, u32 *out_valid)
+{
+    u32 free_count = 0;
+    u32 valid_count = 0;
+    int i;
+
+    if (out_total)
+        *out_total = KDS_BUF_NR_FRAMES;
+
+    if (!g_pool) {
+        if (out_free)
+            *out_free = 0;
+        if (out_valid)
+            *out_valid = 0;
+        return;
+    }
+
+    /*
+     * Plain scan, no locking: this is a best-effort debug snapshot,
+     * not a value anything correctness-sensitive depends on. Each
+     * frame's state can change concurrently while this loop runs;
+     * the counts may be off by a frame or two under load, which is
+     * an acceptable tradeoff against taking 4096 individual
+     * frame_locks (or one global lock) just to report a number for
+     * a diagnostic command.
+     */
+    for (i = 0; i < KDS_BUF_NR_FRAMES; i++) {
+        switch (g_pool->frames[i].state) {
+        case KDS_FRAME_FREE:
+            free_count++;
+            break;
+        case KDS_FRAME_VALID:
+            valid_count++;
+            break;
+        default:
+            break;
+        }
+    }
+
+    if (out_free)
+        *out_free = free_count;
+    if (out_valid)
+        *out_valid = valid_count;
 }

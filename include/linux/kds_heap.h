@@ -14,9 +14,10 @@
  *                           the offset just past the last slot
  *   [ ... free space ... ]
  *   [ tuple data      ]  <- grows upward (toward lower offsets) from
- *                           the end of the page; meta.upper tracks
- *                           the offset of the start of the last
- *                           tuple written
+ *                           meta.upper; meta.upper tracks the offset
+ *                           of the start of the last tuple written
+ *   [ next_page_id    ]  <- last sizeof(kds_page_id_t) bytes of the
+ *                           page, see KDS_HEAP_NEXT_PAGE_OFFSET below
  *
  * meta.lower and meta.upper are absolute byte offsets from the start
  * of the page (not relative to the heap area). The page is full when
@@ -27,7 +28,23 @@
  * change even if compaction moves the tuple bytes around), and
  * physical compaction is a separate, not-yet-implemented operation
  * (see heap_compact_page() note below).
+ *
+ * next_page_id chaining: the last sizeof(kds_page_id_t) bytes of
+ * every heap page are reserved (meta.upper never grows past
+ * KDS_HEAP_NEXT_PAGE_OFFSET, see heap_init_page_as()) for a single
+ * forward link to the next heap page belonging to the same table, or
+ * 0 if this is the last page in the chain. This makes a table's
+ * heap storage a singly-linked list of pages, so a table can grow
+ * past one page and still be scanned start-to-finish (root page,
+ * follow next_page_id, repeat until 0) with no index of any kind.
+ * The obvious limitation: only a full scan is possible this way --
+ * there's no way to jump to "the page containing key K" without
+ * walking the whole chain, which is exactly the gap a real index
+ * (btree) exists to close. See heap_get_next_page_id()/
+ * heap_set_next_page_id() below.
  */
+
+#define KDS_HEAP_NEXT_PAGE_OFFSET  (KDS_PAGE_SIZE - sizeof(kds_page_id_t))
 
 typedef struct kds_heap_page_meta {
     u16     nr_slots;
@@ -125,9 +142,20 @@ void heap_init_page_as(kds_frame_t *frame, kds_page_type_t type);
 
 /* Initializes an empty heap page: sets the common header's type to
  * KDS_PAGE_TYPE_HEAP and resets the heap metadata (nr_slots = 0,
- * lower/upper bracketing an empty free-space region). Does not write
- * to disk -- caller is responsible for marking dirty / flushing. */
+ * lower/upper bracketing an empty free-space region, with upper
+ * already excluding the tail next_page_id reservation). Also writes
+ * 0 (no next page) into the tail. Does not write to disk -- caller
+ * is responsible for marking dirty / flushing. */
 void heap_init_page(kds_frame_t *frame);
+
+/*
+ * Reads/writes the tail next_page_id link. 0 means "no next page"
+ * (end of chain) -- consistent with page_id 0 never being a valid
+ * assigned page_id elsewhere in this codebase (kds_meta.h's
+ * assign_page_id() starts counting from 1).
+ */
+kds_page_id_t heap_get_next_page_id(kds_frame_t *frame);
+int heap_set_next_page_id(kds_frame_t *frame, kds_page_id_t next_page_id);
 
 /* Returns the number of free bytes currently available for a new
  * slot + tuple in this page (i.e. upper - lower). */

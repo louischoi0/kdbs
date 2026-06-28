@@ -30,6 +30,19 @@ int kds_init_page_alloc_system(void);
 void kds_shutdown_page_alloc_system(void);
 
 /*
+ * Reports the page-id allocator's current state:
+ *   out_alloc_point/out_alloc_remaining: the standing id range
+ *     (see PRE_ALLOC_NUM/PRE_ALLOC_PAGE_THRES above)
+ *   out_ring_count: frames currently staged in the pre-allocation
+ *     ring, ready to be handed out by kds_page_alloc()
+ *   out_freelist_count: ids currently on the id-reuse freelist
+ * All zero if the allocator hasn't been initialized yet
+ * (kds_init_page_alloc_system() not called/failed).
+ */
+void kds_page_alloc_get_stats(kds_page_id_t *out_alloc_point, u64 *out_alloc_remaining,
+                               u64 *out_ring_count, u64 *out_freelist_count);
+
+/*
  * Returns a pinned, freshly-typed kds_frame_t* for a new logical
  * page, or NULL if the pre-allocation ring is currently empty
  * (the background kds_proc_prealloc refill hasn't caught up).
@@ -42,7 +55,7 @@ kds_frame_t *kds_page_alloc(kds_page_type_t type);
 /*
  * Returns a previously freed page_id to the allocator's freelist for
  * future reuse. Deliberately takes a bare kds_page_id_t rather than
- * a kds_page_t*  /kds_frame_t* -- by the time a page is freed, its
+ * a kds_page_t* /kds_frame_t* -- by the time a page is freed, its
  * frame may already be gone (evicted/reused), so the freelist must
  * not hold a pointer into frame/page memory whose lifetime it
  * doesn't own. Reusing a freed id is the allocator's job, not the

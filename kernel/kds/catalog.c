@@ -1,5 +1,6 @@
 #include <linux/kds.h>
 #include <linux/kds_catalog.h>
+#include <linux/kds_types.h>
 #include <linux/kds_page_mgr.h>
 #include <linux/kds_page_alloc.h>
 #include <linux/kds_heap.h>
@@ -162,6 +163,12 @@ void kds_catalog_init_well_known_objects(void)
     register_type(KDS_OID_TYPE_TABLE, "type_table");
     register_type(KDS_OID_TYPE_OPERATOR, "type_operator");
     register_type(KDS_OID_TYPE_INDEX, "type_index");
+
+    register_type(KDS_OID_TYPE_INT8, "type_int8");
+    register_type(KDS_OID_TYPE_INT16, "type_int16");
+    register_type(KDS_OID_TYPE_INT32, "type_int32");
+    register_type(KDS_OID_TYPE_FLOAT, "type_float");
+    register_type(KDS_OID_TYPE_DECIMAL, "type_decimal");
 }
 
 /* ------------------------------------------------------------------
@@ -339,26 +346,43 @@ int kds_catalog_bootstrap(void)
         }
     }
 
-    /* sys.types rows for the well-known scalar types. */
+    /*
+     * sys.types rows for the well-known scalar types -- type_val/len
+     * are pulled from the kds_types.h registry instead of being
+     * hardcoded here a second time. Only the oid (catalog identity)
+     * and the registry lookup name need to be listed; adding a new
+     * type to kds_types.h's table does NOT require touching this
+     * list too unless it should also get a sys.types bootstrap row.
+     */
     {
         static const struct {
             kd_oid_t    oid;
-            const char  *name;
-            u32         type_val;
-            u32         len;
+            const char  *type_name;   /* kds_types.h registry name */
         } types[] = {
-            { KDS_OID_TYPE_INT,     "int",     0, sizeof(s64) },
-            { KDS_OID_TYPE_VARCHAR, "varchar", 1, 0 },
-            { KDS_OID_TYPE_CHAR,    "char",    2, 0 },
-            { KDS_OID_TYPE_BOOL,    "bool",    3, sizeof(u8) },
+            { KDS_OID_TYPE_INT8,    "int8"    },
+            { KDS_OID_TYPE_INT16,   "int16"   },
+            { KDS_OID_TYPE_INT32,   "int32"   },
+            { KDS_OID_TYPE_INT64,   "int64"   },
+            { KDS_OID_TYPE_FLOAT,   "float"   },
+            { KDS_OID_TYPE_DECIMAL, "decimal" },
+            { KDS_OID_TYPE_BOOL,    "bool"    },
+            { KDS_OID_TYPE_VARCHAR, "varchar" },
+            { KDS_OID_TYPE_CHAR,    "char"    },
         };
 
         for (i = 0; i < ARRAY_SIZE(types); i++) {
-            ret = insert_sys_type_row(types[i].oid, types[i].name,
-                                       types[i].type_val, types[i].len);
+            const kds_type_desc_t *desc = kds_type_lookup_by_name(types[i].type_name);
+
+            if (!desc) {
+                pr_err("kds_catalog: no type descriptor for '%s' (bug: kds_types.h registry mismatch)\n",
+                       types[i].type_name);
+                return -EINVAL;
+            }
+
+            ret = insert_sys_type_row(types[i].oid, desc->name, desc->type_val, desc->fixed_len);
             if (ret) {
                 pr_err("kds_catalog: failed to insert sys.types row for %s: %d\n",
-                       types[i].name, ret);
+                       desc->name, ret);
                 return ret;
             }
         }
