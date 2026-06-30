@@ -4,6 +4,7 @@
 #include <linux/kds.h>
 #include <linux/kds_relation.h>
 #include <linux/kds_heap.h>
+#include <linux/ktime.h>
 
 /*
  * C port of the Python POC's executor.py state-pattern design
@@ -15,33 +16,107 @@
  * actually invoke; they never need to know which concrete exec type
  * they're holding beyond having called the matching *_init().
  *
- * v1 scope: kds_exec_state_t.run() is single-shot (does all its
- * work in one call and returns DONE/ERROR), unlike kds_proc_t's
- * run(proc, slice_ns), which is explicitly re-entrant/time-sliced.
- * Heap insert is fast enough that this doesn't need to yield
- * mid-operation yet -- if a future exec type needs to span multiple
- * scheduler slices (e.g. a multi-page btree rebuild), that's a
- * reason to add a slice_ns parameter and a CONTINUE result, not to
- * redesign this from scratch.
+ * v2 scope (supersedes the v1 single-shot design): run() is now
+ * re-entrant and time-sliced, mirroring kds_proc_t's run(proc,
+ * slice_ns) signature exactly -- on purpose, since the intended
+ * caller of kds_exec_run() is a kds_proc_t's own run() callback
+ * (see kds_dshell.c's dshell proc, or any future query-executing
+ * proc), and a single shared time-budget convention between the two
+ * layers means a proc can simply hand its own slice_ns straight
+ * through without any unit conversion or re-scaling.
+ *
+ * Every concrete exec is responsible for checking its elapsed time
+ * against the budget at reasonably fine granularity (e.g. once per
+ * page visited, once per row scanned -- NOT once per whole table)
+ * and returning KDS_EXEC_CONTINUE as soon as it's spent the budget,
+ * having first saved enough state in itself (not on the stack) to
+ * resume exactly where it left off on the next call. This is the
+ * same "checkpoint progress into the struct, not into call-stack
+ * locals" discipline kds_btree_cursor_t already uses for multi-page
+ * btree walks -- run() must never assume it gets to keep its stack
+ * frame between calls, because it doesn't.
+ *
+ * kds_exec_run() takes over budget-checking duties that used to be
+ * entirely the caller's problem: it tracks wall-clock time itself
+ * via ktime_get() so individual exec implementations only need to
+ * compare against an absolute deadline already computed for them
+ * (state->deadline_ns) rather than each reimplementing "how much
+ * time do I have left" bookkeeping.
  */
 
 typedef enum kds_exec_result {
     KDS_EXEC_DONE,
     KDS_EXEC_ERROR,
+    /*
+     * Slice budget exhausted before the work finished. All progress
+     * has been checkpointed inside the concrete exec struct (NOT in
+     * kds_exec_state_t itself, which has no room for per-exec
+     * progress fields) -- the caller is expected to call
+     * kds_exec_run() again, with a fresh slice_ns, to resume. The
+     * caller must not free or otherwise invalidate the exec struct
+     * between CONTINUE and the next run() call, since that's where
+     * all the resume state lives.
+     */
+    KDS_EXEC_CONTINUE,
 } kds_exec_result_t;
 
 typedef struct kds_exec_state kds_exec_state_t;
 
-typedef kds_exec_result_t (*kds_exec_run_fn)(kds_exec_state_t *state);
+typedef kds_exec_result_t (*kds_exec_run_fn)(kds_exec_state_t *state, u64 slice_ns);
 
 struct kds_exec_state {
     kds_exec_run_fn      run;
     int                  ret;     /* errno, meaningful when run() returned KDS_EXEC_ERROR */
+
+    /*
+     * Absolute deadline for the *current* run() call, in ktime_get()
+     * nanoseconds. Set fresh by kds_exec_run() on every call from
+     * the slice_ns just handed to it -- a concrete exec's run()
+     * checks ktime_get() against this rather than tracking its own
+     * elapsed time, so the "have I used up my slice yet" check is
+     * one comparison everywhere, not reimplemented per exec type.
+     */
+    u64                  deadline_ns;
+
+    /*
+     * Running count of "units of work" done across the exec's
+     * entire lifetime (every CONTINUE and the final DONE) -- a unit
+     * is whatever the concrete exec considers one checkpoint-able
+     * step (one page visited, one row scanned, etc). Purely
+     * informational: not used by kds_exec_run() itself, but every
+     * concrete exec increments it at the same granularity it checks
+     * the deadline at, so callers/debugging tools (e.g. a future
+     * PSTA-style dshell command for in-flight execs) have a
+     * consistent progress signal regardless of exec type.
+     */
+    u64                  units_done;
 };
 
-static inline kds_exec_result_t kds_exec_run(kds_exec_state_t *state)
+/*
+ * Computes this call's deadline from slice_ns and dispatches to the
+ * concrete exec's run(). Concrete run() implementations should call
+ * kds_exec_slice_expired() (below) rather than reading
+ * state->deadline_ns directly, in case the expiry check itself ever
+ * needs to grow (e.g. a minimum-progress guarantee) without having
+ * to touch every exec type.
+ */
+static inline kds_exec_result_t kds_exec_run(kds_exec_state_t *state, u64 slice_ns)
 {
-    return state->run(state);
+    state->deadline_ns = ktime_get_ns() + slice_ns;
+    return state->run(state, slice_ns);
+}
+
+/*
+ * True once the current run() call's slice budget has been spent.
+ * Concrete execs call this at the top of each loop iteration (after
+ * completing at least one unit of work -- never before doing any
+ * work at all, or a slice_ns of 0 / an already-elapsed deadline
+ * would make run() return CONTINUE without ever making progress,
+ * which would spin forever one call at a time).
+ */
+static inline bool kds_exec_slice_expired(kds_exec_state_t *state)
+{
+    return ktime_get_ns() >= state->deadline_ns;
 }
 
 /* ------------------------------------------------------------------
@@ -62,27 +137,42 @@ static inline kds_exec_result_t kds_exec_run(kds_exec_state_t *state)
  * in dshell.c), not a per-column flag on kds_sys_column_t. Because
  * of that fixed layout, this exec can read the new row's PK straight
  * out of the first 8 bytes of `data` without needing to consult the
- * schema at all. Before attempting the insert, run() does a full
- * scan of the table's entire page chain checking for an existing
- * live tuple with the same PK; if found, returns KDS_EXEC_ERROR with
- * base.ret == -EEXIST and does not insert anything.
+ * schema at all.
  *
- * KNOWN COST: that duplicate check is, unavoidably, a full table
- * scan on every single insert (no PK index exists yet -- see the
- * project's "lookup 없이 풀스캔" design discussion). This is
- * expected to get expensive as tables grow past a handful of pages;
- * a real PK index is the eventual fix, not attempted here.
+ * PHASES (this is the state machine -- see kds_executor.c for the
+ * implementation of each):
  *
- * KNOWN INEFFICIENCY: there is no cached "tail page" anywhere
- * (kds_relation_t/sys.tables only know the chain's root page), so
- * the insert-after-dup-check walk also starts from the root every
- * time. Fine for short chains; if tables routinely grow to many
- * pages, this becomes an O(pages) cost per insert on top of the
- * duplicate-check scan above. Caching the tail page_id would need a
- * new field somewhere persistent (e.g. sys.tables or a separate
- * per-relation runtime cache) -- not added here to avoid changing a
- * catalog struct other code depends on without being asked to.
+ *   KDS_HEAP_INSERT_PHASE_DUP_SCAN
+ *     Walking the chain from root_page_id checking for an existing
+ *     live tuple with the same PK. Resumable: scan_page_id is the
+ *     next page to load, picking up exactly where the last call
+ *     left off. On finding a duplicate: KDS_EXEC_ERROR / -EEXIST.
+ *     On reaching the end of chain with no match: advance to
+ *     PHASE_FIND_TAIL.
+ *
+ *   KDS_HEAP_INSERT_PHASE_FIND_TAIL
+ *     Walking the chain again (from root_page_id, since the dup
+ *     scan didn't keep the frames pinned or remember which page had
+ *     space) looking for a page with room, or the literal end of
+ *     chain if none do. Resumable the same way as the scan phase.
+ *     On success: advance to PHASE_DONE having performed the
+ *     insert (allocating + linking a new tail page first if
+ *     needed).
+ *
+ * This is a full table scan on every insert in the worst case (no
+ * PK index exists yet), same known cost as the v1 design -- splitting
+ * it into a resumable state machine changes *when* the CPU time is
+ * spent (across multiple scheduler slices instead of one
+ * uninterrupted burst) but not *how much total work* an insert
+ * does. A real PK index remains the eventual fix for the total work
+ * itself.
  * ------------------------------------------------------------------ */
+
+typedef enum kds_heap_insert_phase {
+    KDS_HEAP_INSERT_PHASE_DUP_SCAN = 0,
+    KDS_HEAP_INSERT_PHASE_FIND_TAIL,
+    KDS_HEAP_INSERT_PHASE_DONE,
+} kds_heap_insert_phase_t;
 
 typedef struct kds_heap_insert_exec {
     kds_exec_state_t     base;
@@ -95,6 +185,18 @@ typedef struct kds_heap_insert_exec {
 
     /* output, valid after a KDS_EXEC_DONE run() */
     kds_heap_tid_t       out_tid;
+
+    /* --------------------------------------------------------------
+     * Resume state -- everything a CONTINUE needs to pick back up
+     * exactly where the last run() call left off. Nothing about
+     * this exec's progress is allowed to live anywhere else (not on
+     * run()'s C stack, not in caller-local variables), since the
+     * struct itself is the only thing guaranteed to survive between
+     * one run() call and the next.
+     * -------------------------------------------------------------- */
+    kds_heap_insert_phase_t  phase;
+    kds_page_id_t            cursor_page_id; /* next page to visit in the current phase */
+    s64                      new_pk;          /* decoded once, reused by both phases */
 } kds_heap_insert_exec_t;
 
 void kds_heap_insert_exec_init(kds_heap_insert_exec_t *exec, kds_relation_t *rel,

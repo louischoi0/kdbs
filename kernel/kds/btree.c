@@ -415,6 +415,439 @@ int btree_insert(kds_page_id_t root_page_id, kds_tuple_id_t key,
     return ret;
 }
 
+/*
+ * Minimum key count before a node is considered underflowed.
+ * Standard B-tree invariant: every non-root node must hold at
+ * least ceil(BTREE_MAX_KEYS / 2) keys (using floor here is the
+ * common simplification and matches the mid-point split used in
+ * btree_split_node() above, so a merge of two underflowed nodes
+ * never exceeds BTREE_MAX_KEYS). If kds_btree.h already defines
+ * BTREE_MIN_KEYS, that one wins; this is only a fallback.
+ */
+#ifndef BTREE_MIN_KEYS
+#define BTREE_MIN_KEYS (BTREE_MAX_KEYS / 2)
+#endif
+
+/*
+ * Removes the key/slot pair at `pos` from a node, shifting
+ * everything after it down by one. This is the exact mirror of
+ * btree_node_insert_at() above.
+ *
+ * For a leaf (level == 0), slots[pos] is the data pointer
+ * associated with keys[pos], so removing keys[pos] also removes
+ * slots[pos] and slots[pos+1..] shift down to slots[pos..].
+ *
+ * For an internal node, slots[pos] is the *left* child of
+ * keys[pos] and slots[pos+1] is the right child; removing keys[pos]
+ * removes the redundant child pointer slots[pos+1] (the convention
+ * used by btree_handle_underflow()'s merge/redistribute helpers
+ * below -- the caller is always removing the separator key together
+ * with the child that's being folded away on its right).
+ */
+static void btree_node_remove_at(kds_btree_node_t *node, int pos)
+{
+    int i;
+
+    for (i = pos; i < node->key_count - 1; i++)
+        node->keys[i] = node->keys[i + 1];
+
+    for (i = pos + 1; i < node->key_count; i++)
+        node->slots[i] = node->slots[i + 1];
+
+    node->key_count--;
+}
+
+static inline bool btree_node_is_underflow(kds_btree_node_t *node)
+{
+    return node->key_count < BTREE_MIN_KEYS;
+}
+
+/*
+ * Redistributes one key/slot from the left sibling into node,
+ * via the parent separator key at parent->keys[sep_pos]. Used when
+ * the left sibling has spare keys (key_count > BTREE_MIN_KEYS) so a
+ * merge isn't needed.
+ *
+ * For a leaf: left's last key/slot moves into node's front, and the
+ * parent separator is updated to node's new smallest key.
+ *
+ * For an internal node, the parent separator key moves down to
+ * become node's new first key, left's last key moves up to become
+ * the new parent separator, and left's last child slot moves to
+ * become node's new first child slot.
+ */
+static void btree_redistribute_from_left(kds_btree_node_t *parent, int sep_pos,
+                                         kds_btree_node_t *left_node,
+                                         kds_btree_node_t *node)
+{
+    int i;
+
+    if (node->level == 0) {
+        /* Leaf: shift node right by one, pull in left's last entry. */
+        for (i = node->key_count; i > 0; i--) {
+            node->keys[i] = node->keys[i - 1];
+            node->slots[i] = node->slots[i - 1];
+        }
+        node->keys[0] = left_node->keys[left_node->key_count - 1];
+        node->slots[0] = left_node->slots[left_node->key_count - 1];
+        node->key_count++;
+
+        left_node->key_count--;
+
+        /* Parent separator becomes node's new smallest key. */
+        parent->keys[sep_pos] = node->keys[0];
+    } else {
+        /* Internal: shift node's keys/slots right by one. */
+        for (i = node->key_count; i > 0; i--)
+            node->keys[i] = node->keys[i - 1];
+        for (i = node->key_count + 1; i > 0; i--)
+            node->slots[i] = node->slots[i - 1];
+
+        /* Old parent separator drops down as node's new first key;
+         * left's last child becomes node's new first child. */
+        node->keys[0] = parent->keys[sep_pos];
+        node->slots[0] = left_node->slots[left_node->key_count];
+        node->key_count++;
+
+        /* Left's last key rises to become the new parent separator. */
+        parent->keys[sep_pos] = left_node->keys[left_node->key_count - 1];
+
+        left_node->key_count--;
+    }
+
+    store_btree_node(left_node);
+    store_btree_node(node);
+    store_btree_node(parent);
+
+    kds_set_page_dirty(left_node->frame->kp);
+    kds_set_page_dirty(node->frame->kp);
+    kds_set_page_dirty(parent->frame->kp);
+}
+
+/* Mirror of btree_redistribute_from_left(): pulls node's leftmost
+ * spare entry from the right sibling instead. */
+static void btree_redistribute_from_right(kds_btree_node_t *parent, int sep_pos,
+                                          kds_btree_node_t *node,
+                                          kds_btree_node_t *right_node)
+{
+    int i;
+
+    if (node->level == 0) {
+        node->keys[node->key_count] = right_node->keys[0];
+        node->slots[node->key_count] = right_node->slots[0];
+        node->key_count++;
+
+        for (i = 0; i < right_node->key_count - 1; i++) {
+            right_node->keys[i] = right_node->keys[i + 1];
+            right_node->slots[i] = right_node->slots[i + 1];
+        }
+        right_node->key_count--;
+
+        /* Parent separator becomes right's new smallest key. */
+        parent->keys[sep_pos] = right_node->keys[0];
+    } else {
+        node->keys[node->key_count] = parent->keys[sep_pos];
+        node->slots[node->key_count + 1] = right_node->slots[0];
+        node->key_count++;
+
+        parent->keys[sep_pos] = right_node->keys[0];
+
+        for (i = 0; i < right_node->key_count - 1; i++)
+            right_node->keys[i] = right_node->keys[i + 1];
+        for (i = 0; i < right_node->key_count; i++)
+            right_node->slots[i] = right_node->slots[i + 1];
+        right_node->key_count--;
+    }
+
+    store_btree_node(node);
+    store_btree_node(right_node);
+    store_btree_node(parent);
+
+    kds_set_page_dirty(node->frame->kp);
+    kds_set_page_dirty(right_node->frame->kp);
+    kds_set_page_dirty(parent->frame->kp);
+}
+
+/*
+ * Merges `right_node` into `left_node` (right_node's contents are
+ * folded into left_node), removing the separator key at
+ * parent->keys[sep_pos] in the process.
+ *
+ * For leaves, left/right are linked via next/prev (see
+ * btree_split_node()), so those links must be patched too.
+ *
+ * Returns 0 on success. The freed page (right_node) is released via
+ * kds_free_page() by the caller (btree_handle_underflow()), since
+ * this function doesn't own right_node's pin.
+ */
+static int btree_merge_nodes(kds_btree_node_t *parent, int sep_pos,
+                             kds_btree_node_t *left_node,
+                             kds_btree_node_t *right_node)
+{
+    int i, base;
+
+    base = left_node->key_count;
+
+    if (left_node->level == 0) {
+        /* Leaf merge: just append right's keys/slots. */
+        for (i = 0; i < right_node->key_count; i++) {
+            left_node->keys[base + i] = right_node->keys[i];
+            left_node->slots[base + i] = right_node->slots[i];
+        }
+        left_node->key_count += right_node->key_count;
+
+        /* Relink leaf chain: left->next = right->next, and patch
+         * right->next's prev pointer if it exists. */
+        left_node->next = right_node->next;
+
+        if (right_node->next != 0) {
+            kds_frame_t *next_frame = kds_buf_lookup_or_load(right_node->next);
+
+            if (!IS_ERR(next_frame)) {
+                kds_btree_node_t next_node;
+
+                load_btree_node(next_frame, &next_node);
+                next_node.prev = left_node->frame->kp->id;
+                store_btree_node(&next_node);
+                kds_buf_unpin(next_frame);
+            } else {
+                pr_warn("btree_merge_nodes: failed to relink next page %llu: %ld\n",
+                        right_node->next, PTR_ERR(next_frame));
+            }
+        }
+    } else {
+        /* Internal merge: parent separator drops down between
+         * left's and right's children. */
+        left_node->keys[base] = parent->keys[sep_pos];
+        for (i = 0; i < right_node->key_count; i++)
+            left_node->keys[base + 1 + i] = right_node->keys[i];
+
+        for (i = 0; i <= right_node->key_count; i++)
+            left_node->slots[base + 1 + i] = right_node->slots[i];
+
+        left_node->key_count += right_node->key_count + 1;
+    }
+
+    /* Remove the separator key and the now-folded-away right child
+     * pointer from the parent. */
+    btree_node_remove_at(parent, sep_pos);
+
+    store_btree_node(left_node);
+    store_btree_node(parent);
+
+    kds_set_page_dirty(left_node->frame->kp);
+    kds_set_page_dirty(parent->frame->kp);
+
+    return 0;
+}
+
+/*
+ * Walks up from the level just above the node that just underflowed
+ * and resolves the underflow at each level, propagating further
+ * underflows upward as needed -- the delete-side mirror of
+ * btree_propagate_split().
+ *
+ * `level` is the index into cursor->nodes[] of the node that is
+ * currently underflowed; this function fixes cursor->nodes[level]
+ * by looking at its parent cursor->nodes[level-1] and that parent's
+ * other child at position cursor->positions[level-1] +/- 1.
+ *
+ * Returns 0 on success. level == 0 (the root) is never rebalanced
+ * here -- shrinking the root is handled by the caller after this
+ * returns, since only the caller holds the page_id needed to update
+ * catalog metadata.
+ */
+static int btree_handle_underflow(kds_btree_cursor_t *cursor, int level)
+{
+    kds_btree_node_t *node, *parent;
+    kds_btree_node_t left_sibling, right_sibling;
+    kds_frame_t *left_frame = NULL, *right_frame = NULL;
+    int pos, ret = 0;
+
+    while (level > 0) {
+        node = &cursor->nodes[level];
+
+        if (!btree_node_is_underflow(node))
+            return 0;
+
+        parent = &cursor->nodes[level - 1];
+        pos = cursor->positions[level - 1];
+        left_frame = NULL;
+        right_frame = NULL;
+
+        /* Try borrowing from the left sibling first. */
+        if (pos > 0) {
+            left_frame = kds_buf_lookup_or_load(parent->slots[pos - 1]);
+            if (!IS_ERR(left_frame)) {
+                load_btree_node(left_frame, &left_sibling);
+
+                if (left_sibling.key_count > BTREE_MIN_KEYS) {
+                    btree_redistribute_from_left(parent, pos - 1,
+                                                  &left_sibling, node);
+                    kds_buf_unpin(left_frame);
+                    return 0;
+                }
+            } else {
+                pr_warn("btree_handle_underflow: failed to load left sibling %llu: %ld\n",
+                        parent->slots[pos - 1], PTR_ERR(left_frame));
+                left_frame = NULL;
+            }
+        }
+
+        /* Then the right sibling. */
+        if (pos < parent->key_count) {
+            right_frame = kds_buf_lookup_or_load(parent->slots[pos + 1]);
+            if (!IS_ERR(right_frame)) {
+                load_btree_node(right_frame, &right_sibling);
+
+                if (right_sibling.key_count > BTREE_MIN_KEYS) {
+                    btree_redistribute_from_right(parent, pos,
+                                                   node, &right_sibling);
+                    if (left_frame)
+                        kds_buf_unpin(left_frame);
+                    kds_buf_unpin(right_frame);
+                    return 0;
+                }
+            } else {
+                pr_warn("btree_handle_underflow: failed to load right sibling %llu: %ld\n",
+                        parent->slots[pos + 1], PTR_ERR(right_frame));
+                right_frame = NULL;
+            }
+        }
+
+        /*
+         * Neither sibling has spare keys -- merge instead. Prefer
+         * merging with the left sibling when it exists (arbitrary
+         * but consistent choice), otherwise merge with the right.
+         */
+        if (left_frame) {
+            ret = btree_merge_nodes(parent, pos - 1, &left_sibling, node);
+            kds_buf_unpin(left_frame);
+
+            if (right_frame)
+                kds_buf_unpin(right_frame);
+
+            if (ret < 0)
+                return ret;
+
+            /* node's page is now empty/absorbed -- free it. */
+            kds_free_page(node->frame);
+        } else if (right_frame) {
+            ret = btree_merge_nodes(parent, pos, node, &right_sibling);
+            kds_buf_unpin(right_frame);
+
+            if (ret < 0)
+                return ret;
+
+            kds_free_page(right_sibling.frame);
+        } else {
+            /* No siblings at all -- node must be the only child,
+             * which only happens if parent has zero other slots.
+             * Nothing to rebalance at this level; let the parent's
+             * own underflow check (if any) be handled by the next
+             * loop iteration. */
+            pr_warn("btree_handle_underflow: node %llu has no siblings to merge with\n",
+                    node->frame->kp->id);
+        }
+
+        level--;
+    }
+
+    return 0;
+}
+
+int btree_delete(kds_page_id_t root_page_id, kds_tuple_id_t key)
+{
+    kds_btree_cursor_t cursor;
+    kds_btree_node_t *leaf;
+    int pos;
+    int ret;
+
+    ret = btree_cursor_search(&cursor, root_page_id, key);
+
+    /*
+     * btree_cursor_search() returns -EEXIST when it finds the key
+     * (it's written for the insert path, where finding the key is
+     * the error case) -- for delete, finding the key is exactly
+     * what we want, so treat -EEXIST as success and anything else
+     * as "key not found" / a real error.
+     */
+    if (ret != -EEXIST) {
+        btree_cursor_cleanup(&cursor);
+        return (ret == 0) ? -ENOENT : ret;
+    }
+
+    leaf = &cursor.nodes[cursor.depth];
+    pos = cursor.positions[cursor.depth];
+
+    btree_node_remove_at(leaf, pos);
+    store_btree_node(leaf);
+    kds_set_page_dirty(leaf->frame->kp);
+
+    /*
+     * Root is allowed to underflow below BTREE_MIN_KEYS (there's no
+     * sibling to redistribute with or merge into at the top level);
+     * it only needs fixing up if it becomes completely empty, which
+     * is handled below after the loop. Non-root levels must
+     * maintain the invariant, so propagate from the leaf's parent
+     * upward.
+     */
+    if (cursor.depth > 0 && btree_node_is_underflow(leaf)) {
+        ret = btree_handle_underflow(&cursor, cursor.depth);
+        if (ret < 0) {
+            btree_cursor_cleanup(&cursor);
+            return ret;
+        }
+    }
+
+    /*
+     * Root collapse: if the root is an internal node and has been
+     * merged down to zero keys (one remaining child), that child
+     * becomes the new root and the old root page is freed -- this
+     * is the exact inverse of the "every level was full" case in
+     * btree_propagate_split() that grows the tree by one level.
+     */
+    {
+        kds_btree_node_t *root = &cursor.nodes[0];
+
+        if (root->level > 0 && root->key_count == 0) {
+            kds_page_id_t child_id = root->slots[0];
+            kds_frame_t *child_frame = kds_buf_lookup_or_load(child_id);
+
+            if (IS_ERR(child_frame)) {
+                pr_err("btree_delete: failed to load collapsing child %llu: %ld\n",
+                       child_id, PTR_ERR(child_frame));
+                btree_cursor_cleanup(&cursor);
+                return PTR_ERR(child_frame);
+            }
+
+            /*
+             * Promote the child to root in place of the old root's
+             * type; the old root page is freed and the child keeps
+             * its own page_id.
+             *
+             * TODO: same caveat as btree_propagate_split()'s new
+             * root case -- whatever catalog metadata stores "the
+             * root page_id for this btree" must be updated to
+             * child_id here, or future lookups will keep starting
+             * from the freed root_page_id.
+             */
+            if (child_frame->kp->hdr.type == KDS_PAGE_TYPE_BTREE_INTERNAL)
+                child_frame->kp->hdr.type = KDS_PAGE_TYPE_BTREE_ROOT;
+
+            kds_set_page_dirty(child_frame->kp);
+            kds_commit_page_hdr(child_frame);
+
+            kds_buf_unpin(child_frame);
+
+            kds_free_page(root->frame);
+        }
+    }
+
+    btree_cursor_cleanup(&cursor);
+    return 0;
+}
+
 static int __kds_btree_traverse_leaf(
     kds_btree_node_t *node,
     kds_frame_t *frame,

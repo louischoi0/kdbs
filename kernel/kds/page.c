@@ -56,7 +56,21 @@ static uint32_t kds_calc_data_crc(uint8_t *page_data)
     data_start = page_data + sizeof(kds_page_hdr_t);
     data_size = KDS_PAGE_SIZE - sizeof(kds_page_hdr_t);
 
-    return crc32(0, data_start, data_size);
+    /*
+     * crc32c() (CRC-32C / Castagnoli polynomial) dispatches to the
+     * arch-optimized implementation when available -- crc32c-intel
+     * on x86 (SSE4.2 CRC32 instruction) or the ARMv8 CRC32 extension
+     * on arm64 -- and falls back to a software table only when the
+     * CPU lacks the feature. The previous crc32() call used the
+     * IEEE 802.3 polynomial, which has no hardware-accelerated path
+     * in this kernel, so it was always pure software regardless of
+     * CPU capability. Switching the on-disk checksum algorithm is a
+     * format change: existing pages written with crc32() will fail
+     * validation against crc32c() and vice versa, so this requires
+     * either a one-time page rewrite/migration or a page format
+     * version bump handled before rollout.
+     */
+    return crc32c(~0, data_start, data_size) ^ ~0;
 }
 
 bool check_valid_page(kds_frame_t *frame)

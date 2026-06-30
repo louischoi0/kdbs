@@ -20,6 +20,7 @@
 #include <linux/completion.h>
 #include <linux/sched.h>
 #include <linux/jiffies.h>
+#include <linux/time64.h>
 #include <linux/vmalloc.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
@@ -54,28 +55,60 @@
  * ------------------------------------------------------------------ */
 
 /*
- * CRTB <table_name> <col_name>:<type> [<col_name>:<type> ...]
+ * CRTB <table_name> [HEAP|BTREE] <col_name>:<type> [<col_name>:<type> ...]
  *
- * Defines a new heap-clustered table in the public namespace.
+ * Defines a new table in the public namespace. The clustered storage
+ * type is optional and defaults to HEAP for backward compatibility
+ * with existing scripts that never specified one.
+ *
  * <type> is any name registered in kds_types.h's type table
  * (int8/int16/int32/int64/float/decimal/bool/varchar/char) --
  * adding a new type there makes it usable here automatically, no
  * change needed in this file.
  *
- * btree-clustered tables are deliberately not exposed here -- this
- * command exists to exercise and validate the heap page layer in
- * isolation first, per the current focus; clustered_type is hardcoded
- * to KDS_CLUSTERED_HEAP.
+ * Disambiguation: argv[2] is treated as the clustered-type keyword
+ * only if it has no ':' in it (every column spec is required to be
+ * "name:type", so a bare token here can't be a valid column spec).
+ * This means a column literally named "HEAP" or "BTREE" without a
+ * ':type' suffix would be misread as the keyword -- not a concern in
+ * practice since every column spec must carry a type, but worth
+ * keeping in mind if this parsing is reused elsewhere.
  *
- * Example: CRTB users id:int64 name:varchar active:bool
+ * Examples:
+ *   CRTB users id:int64 name:varchar active:bool
+ *   CRTB users BTREE id:int64 name:varchar active:bool
+ *   CRTB users HEAP  id:int64 name:varchar active:bool
  */
 static int kds_cmd_create_table(char **argv, int argc, char *out, size_t out_size)
 {
     const char  *table_name = argv[1];
     kds_schema_t *schema;
     kd_oid_t     new_oid;
+    kds_clustered_type_t clustered_type = KDS_CLUSTERED_HEAP;
+    int          col_start = 2;
     int          i;
     int          ret;
+
+    /*
+     * Optional clustered-type keyword right after the table name.
+     * argv[2] is the keyword candidate only when there are still
+     * column specs left after it (argc > 3) and it doesn't contain
+     * ':' -- a real column spec always does.
+     */
+    if (argc > 3 && !strchr(argv[2], ':')) {
+        if (!strcasecmp(argv[2], "HEAP")) {
+            clustered_type = KDS_CLUSTERED_HEAP;
+            col_start = 3;
+        } else if (!strcasecmp(argv[2], "BTREE")) {
+            clustered_type = KDS_CLUSTERED_BTREE;
+            col_start = 3;
+        } else {
+            scnprintf(out, out_size,
+                      "ERR unknown clustered type '%s' (expected HEAP or BTREE)\n",
+                      argv[2]);
+            return -EINVAL;
+        }
+    }
 
     /*
      * kds_schema_t embeds cols[KDS_SCHEMA_MAX_COLUMNS] (32 *
@@ -94,7 +127,7 @@ static int kds_cmd_create_table(char **argv, int argc, char *out, size_t out_siz
         return -ENOMEM;
     }
 
-    for (i = 2; i < argc; i++) {
+    for (i = col_start; i < argc; i++) {
         char *spec = argv[i];
         char *col_name;
         char *type_name;
@@ -149,7 +182,9 @@ static int kds_cmd_create_table(char **argv, int argc, char *out, size_t out_siz
      * enforcing it here, at the one place tables get defined, is
      * what makes HeapPageInsertExec's duplicate-PK check (see
      * kds_executor.h) able to assume "first 8 bytes = PK" for every
-     * heap table without any further bookkeeping.
+     * heap table without any further bookkeeping. Applies equally
+     * to btree-clustered tables, since the leaf-level key is the
+     * same PK.
      */
     if (schema->cols[0].type_val != KDS_TYPE_INT64) {
         scnprintf(out, out_size,
@@ -160,7 +195,7 @@ static int kds_cmd_create_table(char **argv, int argc, char *out, size_t out_siz
     }
 
     ret = kds_catalog_create_table(KDS_OID_NAMESPACE_PUBLIC, table_name, schema,
-                                    KDS_CLUSTERED_HEAP, &new_oid);
+                                    clustered_type, &new_oid);
     kfree(schema);
 
     if (ret) {
@@ -168,8 +203,10 @@ static int kds_cmd_create_table(char **argv, int argc, char *out, size_t out_siz
         return ret;
     }
 
-    scnprintf(out, out_size, "OK table '%s' created, oid=%llu, columns=%u\n",
-              table_name, (u64)new_oid, schema->nr_cols);
+    scnprintf(out, out_size,
+              "OK table '%s' created, oid=%llu, columns=%u, clustered=%s\n",
+              table_name, (u64)new_oid, schema->nr_cols,
+              clustered_type == KDS_CLUSTERED_BTREE ? "BTREE" : "HEAP");
     return 0;
 }
 
@@ -193,6 +230,21 @@ static int kds_cmd_create_table(char **argv, int argc, char *out, size_t out_siz
  */
 #define KDS_DSHELL_XID      1
 #define KDS_DSHELL_ROW_MAX  256
+
+/*
+ * Fixed per-call time budget handed to kds_exec_run() from dshell
+ * command handlers. 50ms is generous relative to a single page
+ * visit (page lookup/load + a handful of tuple reads) -- chosen so
+ * that small-to-medium tables finish their entire insert (dup scan
+ * + tail find) in one call, and only pathologically large tables
+ * (many thousands of pages in the duplicate-PK scan) ever observe
+ * KDS_EXEC_CONTINUE here. Not tied to kds_proc.h's own slice
+ * constants -- dshell does not go through the proc scheduler at all
+ * right now (see the file-level comment above), so this is purely a
+ * local "don't hog the CPU on one syscall for an unbounded amount of
+ * time" cap, not a scheduling-fairness budget.
+ */
+#define KDS_DSHELL_EXEC_SLICE_NS  (50ULL * NSEC_PER_MSEC)
 
 static int kds_dshell_encode_row(const kds_schema_t *schema, char **argv,
                                   u8 *buf, size_t buf_size, u16 *out_len)
@@ -310,8 +362,8 @@ static int kds_cmd_insert_row(char **argv, int argc, char *out, size_t out_size)
         return ret;
     }
 
-    if (rel->kind != KDS_CLUSTERED_HEAP) {
-        scnprintf(out, out_size, "ERR '%s' is not heap-clustered\n", table_name);
+    if (rel->kind != KDS_CLUSTERED_HEAP && rel->kind != KDS_CLUSTERED_BTREE) {
+        scnprintf(out, out_size, "ERR '%s' is not heap-clustered or btree-clustrered\n", table_name);
         kds_relation_close(rel);
         return -EINVAL;
     }
@@ -339,7 +391,26 @@ static int kds_cmd_insert_row(char **argv, int argc, char *out, size_t out_size)
      */
     kds_heap_insert_exec_init(&exec, rel, row_buf, row_len, KDS_DSHELL_XID);
 
-    if (kds_exec_run(&exec.base) != KDS_EXEC_DONE) {
+    /*
+     * dshell handlers run synchronously inside the write() syscall
+     * (no proc-scheduler hop -- see the file-level comment above),
+     * so there is no outer slice budget being handed down here.
+     * KDS_DSHELL_EXEC_SLICE_NS is a generous fixed budget chosen so
+     * that the overwhelming majority of inserts (small tables, no
+     * PK-scan blowup yet) finish in a single kds_exec_run() call --
+     * CONTINUE is the exceptional path, not the common one. When it
+     * does come back CONTINUE (a large table's duplicate-PK scan
+     * spanning many pages), this loop just calls back in
+     * immediately with a fresh budget rather than returning
+     * partial progress to the client -- INRW's contract is still
+     * "one write() = one finished command", same as every other
+     * dshell command; only the *internal* CPU usage is now sliced,
+     * not the user-visible request/response shape.
+     */
+    while (kds_exec_run(&exec.base, KDS_DSHELL_EXEC_SLICE_NS) == KDS_EXEC_CONTINUE)
+        ; /* exec carries all resume state in itself -- nothing to do here */
+
+    if (exec.base.ret != 0) {
         if (exec.base.ret == -EEXIST) {
             scnprintf(out, out_size,
                       "ERR duplicate primary key in '%s'\n", table_name);
