@@ -16,7 +16,6 @@
 #include <linux/printk.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
-#include <linux/kref.h>
 #include <linux/completion.h>
 #include <linux/sched.h>
 #include <linux/jiffies.h>
@@ -29,22 +28,96 @@
 #include <linux/mutex.h>
 
 /*
- * /dev/kds is a synchronous request/response character device:
- * one write() = one command, the following read() = that command's
- * response. There is no background polling process and no shared
- * ring buffer anymore -- a client's write()/read() pair maps
- * directly onto one command dispatch, which is what makes this a
- * usable RPC channel (the previous shm-ring version had no response
- * path at all; userspace just guessed "OK").
+ * /dev/kds request/response architecture (v3 -- queue removed):
+ *
+ * write() parses and dispatches the command synchronously. Commands
+ * that are fast and I/O-free (META, PSTA, CRTB) run to completion
+ * right inside write() and return immediately. Commands that drive a
+ * kds_exec_state_t (INRW, SELC, and any future heavy operation)
+ * initialise an exec into client->exec_buf, mark the client as
+ * EXEC_PENDING, and block on client->done waiting for the proc
+ * scheduler to finish the work.
+ *
+ * kds_dshell_proc_run() is called by the KDS proc scheduler on its
+ * normal schedule (same as any other kds_proc_t). It iterates over
+ * all open clients, finds any in EXEC_PENDING state, and calls
+ * kds_exec_run() with the scheduler's slice_ns budget. On
+ * KDS_EXEC_CONTINUE the proc returns KDS_PROC_YIELD_RET so other
+ * procs get a turn; the same client resumes on the next scheduling
+ * round. On DONE or ERROR the proc writes the response into
+ * client->resp_buf, marks the client EXEC_IDLE, and signals
+ * client->done so write() can return to userspace.
+ *
+ * This means:
+ *   - No queue, no kref, no list_head, no spinlock per-write.
+ *   - Heavy exec work (PK-scan, future full btree traversal) is
+ *     genuinely time-sliced by the scheduler, not just capped by
+ *     a local while-CONTINUE loop inside write().
+ *   - write()/read() contract is unchanged from the user's
+ *     perspective: one write() = one command, one read() = its
+ *     response. The only visible difference is that write() may
+ *     block longer (up to KDS_DSHELL_EXEC_TIMEOUT_MS) if the
+ *     scheduler is busy with other procs.
  *
  * Concurrency: each open() gets its own kds_dshell_client_t in
- * file->private_data, so multiple clients (multiple opens of
- * /dev/kds) are independent of each other. A single client's own
- * write()-then-read() is expected to be used sequentially (no
- * internal locking against a client racing itself); cross-client
- * state lives only in the command handlers themselves (e.g. the
- * catalog layer's own locking), not in this file.
+ * file->private_data. Multiple clients are independent. A single
+ * client must not call write() again while still blocked in a
+ * previous write() (no re-entrancy guard -- expected sequential
+ * use from a single-threaded tool like kds_client.py).
  */
+
+/* ------------------------------------------------------------------
+ * Client type, globals, and exec helpers
+ *
+ * Defined before the command handlers because kds_cmd_insert_row()
+ * takes a kds_dshell_client_t * and kds_dshell_submit_insert_exec()
+ * must be visible at its call site. Everything else in the chardev
+ * section (open/release/proc_run/write/read/init/shutdown) follows
+ * after the command table.
+ * ------------------------------------------------------------------ */
+
+#define KDS_DSHELL_DEV_NAME        "kds"
+#define KDS_DSHELL_EXEC_TIMEOUT_MS 5000
+
+typedef enum {
+    KDS_DSHELL_EXEC_IDLE    = 0,
+    KDS_DSHELL_EXEC_PENDING = 1,
+} kds_dshell_exec_state_t;
+
+#define KDS_DSHELL_EXEC_BUF_SIZE  sizeof(kds_heap_insert_exec_t)
+
+typedef struct kds_dshell_client {
+    /* response staging for read() */
+    char                    resp_buf[DSHELL_RESP_MAX];
+    size_t                  resp_len;
+    size_t                  resp_pos;
+
+    /* heavy-exec path */
+    kds_dshell_exec_state_t exec_status;
+    u8                      exec_buf[KDS_DSHELL_EXEC_BUF_SIZE];
+    struct completion       done;
+
+    /* intrusive list -- all open clients so proc_run() can iterate */
+    struct list_head        node;
+} kds_dshell_client_t;
+
+static LIST_HEAD(kds_dshell_clients);
+static DEFINE_SPINLOCK(kds_dshell_clients_lock);
+
+static dev_t         kds_dshell_devt;
+static struct cdev   kds_dshell_cdev;
+static struct class *kds_dshell_class;
+static bool          kds_dshell_inited;
+static kds_proc_t   *kds_dshell_proc;
+
+/*
+ * Forward declaration -- kds_dshell_run_exec_via_proc() is defined
+ * in the chardev section below but called from kds_cmd_insert_row()
+ * in the command-handlers section above it.
+ */
+static int kds_dshell_run_exec_via_proc(kds_dshell_client_t *client);
+static int kds_dshell_submit_insert_exec(kds_dshell_client_t *client,
+                                          kds_heap_insert_exec_t *exec_init);
 
 /* ------------------------------------------------------------------
  * Command handlers
@@ -231,20 +304,7 @@ static int kds_cmd_create_table(char **argv, int argc, char *out, size_t out_siz
 #define KDS_DSHELL_XID      1
 #define KDS_DSHELL_ROW_MAX  256
 
-/*
- * Fixed per-call time budget handed to kds_exec_run() from dshell
- * command handlers. 50ms is generous relative to a single page
- * visit (page lookup/load + a handful of tuple reads) -- chosen so
- * that small-to-medium tables finish their entire insert (dup scan
- * + tail find) in one call, and only pathologically large tables
- * (many thousands of pages in the duplicate-PK scan) ever observe
- * KDS_EXEC_CONTINUE here. Not tied to kds_proc.h's own slice
- * constants -- dshell does not go through the proc scheduler at all
- * right now (see the file-level comment above), so this is purely a
- * local "don't hog the CPU on one syscall for an unbounded amount of
- * time" cap, not a scheduling-fairness budget.
- */
-#define KDS_DSHELL_EXEC_SLICE_NS  (50ULL * NSEC_PER_MSEC)
+
 
 static int kds_dshell_encode_row(const kds_schema_t *schema, char **argv,
                                   u8 *buf, size_t buf_size, u16 *out_len)
@@ -338,8 +398,23 @@ static int kds_dshell_decode_row(const kds_schema_t *schema, const u8 *buf,
 /*
  * INRW <table_name> <val1> <val2> ... (one value per schema column,
  * in column order)
+ *
+ * Drives a kds_heap_insert_exec_t via the proc scheduler:
+ *   1. Parse + validate inputs synchronously in write() context.
+ *   2. Initialise the exec into client->exec_buf.
+ *   3. Hand off to kds_dshell_submit_insert_exec(), which marks the
+ *      client EXEC_PENDING and blocks until kds_dshell_proc_run()
+ *      finishes the work slice-by-slice.
+ *   4. On return, format the response into `out`.
+ *
+ * row_buf is stack-allocated here; the exec's data pointer points
+ * into it, which is safe because this function doesn't return until
+ * kds_dshell_submit_insert_exec() comes back (i.e. the exec is fully
+ * complete before the stack frame is torn down).
  */
-static int kds_cmd_insert_row(char **argv, int argc, char *out, size_t out_size)
+static int kds_cmd_insert_row(kds_dshell_client_t *client,
+                               char **argv, int argc,
+                               char *out, size_t out_size)
 {
     const char *table_name = argv[1];
     kd_oid_t oid;
@@ -363,7 +438,8 @@ static int kds_cmd_insert_row(char **argv, int argc, char *out, size_t out_size)
     }
 
     if (rel->kind != KDS_CLUSTERED_HEAP && rel->kind != KDS_CLUSTERED_BTREE) {
-        scnprintf(out, out_size, "ERR '%s' is not heap-clustered or btree-clustrered\n", table_name);
+        scnprintf(out, out_size,
+                  "ERR '%s' is not heap-clustered or btree-clustered\n", table_name);
         kds_relation_close(rel);
         return -EINVAL;
     }
@@ -382,49 +458,53 @@ static int kds_cmd_insert_row(char **argv, int argc, char *out, size_t out_size)
         return ret;
     }
 
-    /*
-     * HeapPageInsertExec owns the "page full -> allocate a new page
-     * and link it onto the chain" decision now -- this handler no
-     * longer touches kds_buf_lookup_or_load()/heap_insert_tuple()
-     * directly, matching the new executor layer's responsibility
-     * split (see kds_executor.h).
-     */
     kds_heap_insert_exec_init(&exec, rel, row_buf, row_len, KDS_DSHELL_XID);
 
     /*
-     * dshell handlers run synchronously inside the write() syscall
-     * (no proc-scheduler hop -- see the file-level comment above),
-     * so there is no outer slice budget being handed down here.
-     * KDS_DSHELL_EXEC_SLICE_NS is a generous fixed budget chosen so
-     * that the overwhelming majority of inserts (small tables, no
-     * PK-scan blowup yet) finish in a single kds_exec_run() call --
-     * CONTINUE is the exceptional path, not the common one. When it
-     * does come back CONTINUE (a large table's duplicate-PK scan
-     * spanning many pages), this loop just calls back in
-     * immediately with a fresh budget rather than returning
-     * partial progress to the client -- INRW's contract is still
-     * "one write() = one finished command", same as every other
-     * dshell command; only the *internal* CPU usage is now sliced,
-     * not the user-visible request/response shape.
+     * Submit exec to kds_dshell_proc_run() and block until done.
+     * The proc slices the work with the scheduler's own slice_ns
+     * budget, so INRW on a large table no longer monopolises the CPU.
+     * resp_buf is written here (not in proc_run) for the success path:
+     * kds_dshell_submit_insert_exec() returns only after the exec has
+     * reached DONE or ERROR, so exec.out_tid is valid by the time we
+     * read it below.
      */
-    while (kds_exec_run(&exec.base, KDS_DSHELL_EXEC_SLICE_NS) == KDS_EXEC_CONTINUE)
-        ; /* exec carries all resume state in itself -- nothing to do here */
-
-    if (exec.base.ret != 0) {
-        if (exec.base.ret == -EEXIST) {
-            scnprintf(out, out_size,
-                      "ERR duplicate primary key in '%s'\n", table_name);
-        } else {
-            scnprintf(out, out_size, "ERR insert failed: %d\n", exec.base.ret);
-        }
+    ret = kds_dshell_submit_insert_exec(client, &exec);
+    if (ret == -ETIMEDOUT) {
+        /* resp_buf already filled by the timeout handler */
         kds_relation_close(rel);
-        return exec.base.ret;
+        return ret;
     }
 
     kds_relation_close(rel);
 
-    scnprintf(out, out_size, "OK inserted into '%s' at page=%llu slot=%u\n",
-              table_name, (u64)exec.out_tid.page_id, exec.out_tid.slot);
+    /*
+     * exec_buf holds the completed kds_heap_insert_exec_t; cast back
+     * to read out_tid and base.ret (proc_run wrote ERR response for
+     * ERROR, so we only need to handle DONE here).
+     */
+    {
+        kds_heap_insert_exec_t *done_exec =
+            (kds_heap_insert_exec_t *)client->exec_buf;
+
+        if (done_exec->base.ret != 0) {
+            if (done_exec->base.ret == -EEXIST) {
+                scnprintf(out, out_size,
+                          "ERR duplicate primary key in '%s'\n", table_name);
+            } else {
+                scnprintf(out, out_size,
+                          "ERR insert failed: %d\n", done_exec->base.ret);
+            }
+            return done_exec->base.ret;
+        }
+
+        scnprintf(out, out_size,
+                  "OK inserted into '%s' at page=%llu slot=%u\n",
+                  table_name,
+                  (u64)done_exec->out_tid.page_id,
+                  done_exec->out_tid.slot);
+    }
+
     return 0;
 }
 
@@ -612,10 +692,9 @@ static int kds_cmd_show_page_alloc_status(char **argv, int argc, char *out, size
  * ------------------------------------------------------------------ */
 
 static const kds_dshell_cmd_t kds_dshell_cmds[] = {
-    { "CRTB", kds_cmd_create_table,          3 },
-    { "INRW", kds_cmd_insert_row,            3 },
-    { "SELC", kds_cmd_scan_table,            2 },
-    { "META", kds_cmd_show_meta,             1 },
+    { "CRTB", kds_cmd_create_table,           3 },
+    { "SELC", kds_cmd_scan_table,             2 },
+    { "META", kds_cmd_show_meta,              1 },
     { "PSTA", kds_cmd_show_page_alloc_status, 1 },
 };
 
@@ -628,7 +707,35 @@ static const kds_dshell_cmd_t kds_dshell_cmds[] = {
  * generic "unknown command"/"too few arguments" message if dispatch
  * itself couldn't even reach a handler.
  */
-static int __kds_dispatch_dshell_cmd(char **argv, int argc, char *out, size_t out_size)
+/*
+ * The dispatch table fn signature does not carry a client pointer
+ * because most handlers (META, PSTA, CRTB, SELC) don't need it.
+ * Only INRW needs to submit an exec to the proc, and it gets the
+ * client pointer via the dedicated kds_dshell_exec_cmd_t entry type
+ * below. To keep the common path simple, handlers that need a client
+ * are registered in kds_dshell_exec_cmds[] (separate table) and
+ * checked first in dispatch.
+ */
+typedef int (*kds_dshell_exec_fn)(kds_dshell_client_t *client,
+                                   char **argv, int argc,
+                                   char *out, size_t out_size);
+
+typedef struct {
+    const char          *op;
+    kds_dshell_exec_fn   fn;
+    int                  min_args;
+} kds_dshell_exec_cmd_t;
+
+static const kds_dshell_exec_cmd_t kds_dshell_exec_cmds[] = {
+    { "INRW", kds_cmd_insert_row, 3 },
+};
+
+#define KDS_DSHELL_EXEC_CMD_COUNT \
+    (sizeof(kds_dshell_exec_cmds) / sizeof(kds_dshell_exec_cmds[0]))
+
+static int __kds_dispatch_dshell_cmd(kds_dshell_client_t *client,
+                                      char **argv, int argc,
+                                      char *out, size_t out_size)
 {
     u32 i;
 
@@ -637,6 +744,21 @@ static int __kds_dispatch_dshell_cmd(char **argv, int argc, char *out, size_t ou
         return -EINVAL;
     }
 
+    /* Check exec-capable commands first (need client pointer). */
+    for (i = 0; i < KDS_DSHELL_EXEC_CMD_COUNT; i++) {
+        if (strcmp(argv[0], kds_dshell_exec_cmds[i].op))
+            continue;
+
+        if (argc < kds_dshell_exec_cmds[i].min_args) {
+            scnprintf(out, out_size, "ERR %s requires at least %d arg(s), got %d\n",
+                      argv[0], kds_dshell_exec_cmds[i].min_args, argc);
+            return -EINVAL;
+        }
+
+        return kds_dshell_exec_cmds[i].fn(client, argv, argc, out, out_size);
+    }
+
+    /* Then lightweight commands (no client pointer needed). */
     for (i = 0; i < KDS_DSHELL_CMD_COUNT; i++) {
         if (strcmp(argv[0], kds_dshell_cmds[i].op))
             continue;
@@ -678,63 +800,23 @@ int kds_split_cmd(char *buf, char *argv[], int max_args)
  * Character device: /dev/kds
  * ------------------------------------------------------------------ */
 
-#define KDS_DSHELL_DEV_NAME "kds"
-
-typedef struct kds_dshell_client {
-    char    cmd_buf[DSHELL_LINE_MAX];
-    char    resp_buf[DSHELL_RESP_MAX];
-    size_t  resp_len;
-    size_t  resp_pos;
-} kds_dshell_client_t;
-
-/*
- * A queued command request. Heap-allocated and refcounted (kref),
- * NOT stack-allocated, for a specific reason: write() waits on
- * req->done with a *timeout* (kds_dshell_write() below), and if that
- * wait times out, write() must be able to give up and return without
- * the kds_proc consumer (kds_dshell_proc_run()) crashing if it's
- * already holding a pointer to req and is mid-way through filling in
- * resp_buf. A stack-allocated struct would make that a use-after-
- * return memory corruption bug the moment the timeout path returns
- * while the consumer is still touching it.
- *
- * With kref: write() holds one reference, the queue (and whoever
- * dequeues it) holds the other. Whichever side finishes last is the
- * one that actually frees it -- safe regardless of which side gives
- * up or finishes first.
- */
-typedef struct kds_dshell_request {
-    struct kref         kref;
-    char                cmd_buf[DSHELL_LINE_MAX];
-    char                resp_buf[DSHELL_RESP_MAX];
-    struct completion   done;
-    struct list_head    queue_node;
-} kds_dshell_request_t;
-
-#define KDS_DSHELL_REQUEST_TIMEOUT_MS  5000
-
-static LIST_HEAD(kds_dshell_queue);
-static DEFINE_SPINLOCK(kds_dshell_queue_lock);
-
-static dev_t kds_dshell_devt;
-static struct cdev kds_dshell_cdev;
-static struct class *kds_dshell_class;
-static bool kds_dshell_inited;
-static kds_proc_t *kds_dshell_proc;
-
-static void kds_dshell_request_release(struct kref *kref)
-{
-    kds_dshell_request_t *req = container_of(kref, kds_dshell_request_t, kref);
-
-    kfree(req);
-}
-
 static int kds_dshell_open(struct inode *inode, struct file *filp)
 {
-    kds_dshell_client_t *client = kzalloc(sizeof(*client), GFP_KERNEL);
+    kds_dshell_client_t *client;
 
+    BUILD_BUG_ON(KDS_DSHELL_EXEC_BUF_SIZE < sizeof(kds_heap_insert_exec_t));
+
+    client = kzalloc(sizeof(*client), GFP_KERNEL);
     if (!client)
         return -ENOMEM;
+
+    init_completion(&client->done);
+    INIT_LIST_HEAD(&client->node);
+    client->exec_status = KDS_DSHELL_EXEC_IDLE;
+
+    spin_lock(&kds_dshell_clients_lock);
+    list_add_tail(&client->node, &kds_dshell_clients);
+    spin_unlock(&kds_dshell_clients_lock);
 
     filp->private_data = client;
     return 0;
@@ -742,149 +824,213 @@ static int kds_dshell_open(struct inode *inode, struct file *filp)
 
 static int kds_dshell_release(struct inode *inode, struct file *filp)
 {
-    kfree(filp->private_data);
+    kds_dshell_client_t *client = filp->private_data;
+
+    if (!client)
+        return 0;
+
+    spin_lock(&kds_dshell_clients_lock);
+    list_del(&client->node);
+    spin_unlock(&kds_dshell_clients_lock);
+
+    /*
+     * If write() is still blocked on done, wake it with a shutdown
+     * signal. In normal usage release() is only called after write()
+     * has returned, but be defensive: a process that closes the fd
+     * from a signal handler while write() is sleeping is possible.
+     */
+    if (client->exec_status == KDS_DSHELL_EXEC_PENDING) {
+        scnprintf(client->resp_buf, sizeof(client->resp_buf),
+                  "ERR client closed while exec in flight\n");
+        complete(&client->done);
+    }
+
+    kfree(client);
     filp->private_data = NULL;
     return 0;
 }
 
 /*
- * Drains every request currently on the queue, running each one
- * through the same parse+dispatch path the old synchronous write()
- * handler used to run inline. This is what makes dshell command
- * execution happen on the scheduler's terms (this function only
- * runs when kds_proc_schedule() picks kds_dshell_proc, exactly like
- * any other system proc) instead of directly in whatever process
- * context called write().
- *
- * Drains the whole queue per call rather than capping how many
- * requests it services -- simplest behavior, and fine for the
- * expected dshell load (a debug/admin channel, not a hot data path).
- * If this ever needs to yield mid-drain to be fairer to other system
- * procs sharing the CPU, that's a straightforward follow-up (check
- * an elapsed-time budget against slice_ns inside the loop).
+ * Called by the KDS proc scheduler. Iterates all open clients and
+ * advances any that are in EXEC_PENDING state by one slice_ns worth
+ * of work. Returns KDS_PROC_YIELD_RET after finding one CONTINUE
+ * result (so other procs get a turn), or after servicing all pending
+ * clients if they all finished in this slice.
  */
 static kds_proc_result_t kds_dshell_proc_run(kds_proc_t *proc, u64 slice_ns)
 {
-    kds_dshell_request_t *req;
-    char *argv[DSHELL_MAX_ARGS];
-    int argc;
+    kds_dshell_client_t *client;
+    kds_exec_result_t result;
 
-    for (;;) {
-        spin_lock(&kds_dshell_queue_lock);
-        if (list_empty(&kds_dshell_queue)) {
-            spin_unlock(&kds_dshell_queue_lock);
-            break;
+    spin_lock(&kds_dshell_clients_lock);
+
+    list_for_each_entry(client, &kds_dshell_clients, node) {
+        if (client->exec_status != KDS_DSHELL_EXEC_PENDING)
+            continue;
+
+        /*
+         * Drop the lock before calling kds_exec_run(): exec work
+         * may touch page_mgr, heap, btree, etc., all of which have
+         * their own internal locking. Holding clients_lock across
+         * that would create a lock-ordering hazard and would block
+         * open()/release() for the full duration of the slice.
+         *
+         * Re-acquire after exec returns to update exec_status and
+         * signal done. This is safe: the client is pinned in memory
+         * for as long as the file descriptor is open
+         * (kds_dshell_release() removes from the list and then frees,
+         * in that order, and it takes the lock to do the removal --
+         * so a client can't disappear under us between the
+         * list_for_each_entry and the re-lock below).
+         */
+        spin_unlock(&kds_dshell_clients_lock);
+
+        result = kds_exec_run((kds_exec_state_t *)client->exec_buf, slice_ns);
+
+        spin_lock(&kds_dshell_clients_lock);
+
+        if (result == KDS_EXEC_CONTINUE) {
+            /* Budget spent; yield to other procs and resume next round. */
+            spin_unlock(&kds_dshell_clients_lock);
+            return KDS_PROC_YIELD_RET;
         }
-        req = list_first_entry(&kds_dshell_queue, kds_dshell_request_t, queue_node);
-        /* list_del_init(), not list_del() -- kds_dshell_write()'s
-         * timeout path checks list_empty(&req->queue_node) to tell
-         * whether this request is still queued (and therefore safe
-         * for it to remove and reclaim itself) versus already
-         * dequeued here (in which case it must back off and leave
-         * req alone). list_del_init() is what makes that check mean
-         * what it needs to mean. */
-        list_del_init(&req->queue_node);
-        spin_unlock(&kds_dshell_queue_lock);
 
-        argc = kds_split_cmd(req->cmd_buf, argv, DSHELL_MAX_ARGS);
-        if (argc < 0) {
-            scnprintf(req->resp_buf, sizeof(req->resp_buf),
-                      "ERR failed to parse command\n");
-        } else {
-            __kds_dispatch_dshell_cmd(argv, argc, req->resp_buf, sizeof(req->resp_buf));
+        /* DONE or ERROR: finalise the response and wake write(). */
+        if (result == KDS_EXEC_ERROR) {
+            kds_exec_state_t *es = (kds_exec_state_t *)client->exec_buf;
+
+            scnprintf(client->resp_buf, sizeof(client->resp_buf),
+                      "ERR exec failed: %d\n", es->ret);
         }
+        /* On DONE, resp_buf was already filled by the handler that
+         * set up the exec (see kds_cmd_insert_row() below) -- the
+         * handler writes success output after kds_exec_run() returns
+         * in the fast path, but for the slow (proc) path it can't
+         * do that because it's not on the proc's call stack. So the
+         * convention is: the handler leaves resp_buf empty and the
+         * proc fills it here. See the INRW handler for the actual
+         * pattern. */
 
-        /* Signal completion before dropping the queue's reference --
-         * order doesn't actually matter for correctness here (kref
-         * guarantees req isn't freed until both sides have dropped
-         * their reference, regardless of order), but completing
-         * first means a waiter that's been timing out right at this
-         * instant has the best chance of seeing its real response
-         * instead of racing a timeout. */
-        complete(&req->done);
-        kref_put(&req->kref, kds_dshell_request_release);
+        client->resp_len = strnlen(client->resp_buf, sizeof(client->resp_buf));
+        client->resp_pos = 0;
+        client->exec_status = KDS_DSHELL_EXEC_IDLE;
+
+        complete(&client->done);
     }
 
+    spin_unlock(&kds_dshell_clients_lock);
     return KDS_PROC_YIELD_RET;
 }
 
 /*
- * Enqueues the command for kds_dshell_proc_run() to service on its
- * own schedule, then blocks (with a bounded timeout, not forever)
- * until that happens. write() itself does no command parsing or
- * dispatch anymore -- it only builds the request and waits.
+ * Runs a heavy exec (one that drives a kds_exec_state_t) from
+ * write() context. Registers the exec into client->exec_buf, marks
+ * the client EXEC_PENDING so kds_dshell_proc_run() can pick it up,
+ * then blocks on client->done.
+ *
+ * The resp_buf is filled either:
+ *   - by the proc (DONE/ERROR path in kds_dshell_proc_run()), or
+ *   - by this function's timeout handler.
+ *
+ * Returns 0 if the exec completed (DONE), or a negative errno.
  */
+static int kds_dshell_run_exec_via_proc(kds_dshell_client_t *client)
+{
+    long wait_ret;
+
+    reinit_completion(&client->done);
+
+    /*
+     * Publish the exec to the proc *after* reinit_completion() --
+     * if the proc is already running on another CPU, it must see the
+     * freshly reset completion, not a stale one from a previous
+     * command. WRITE_ONCE on exec_status provides the needed barrier
+     * without requiring a spinlock here (the proc reads exec_status
+     * inside kds_dshell_clients_lock, but this store happens in
+     * write() context, which is single-threaded per client by
+     * construction, so there's no write-write race).
+     */
+    WRITE_ONCE(client->exec_status, KDS_DSHELL_EXEC_PENDING);
+
+    wait_ret = wait_for_completion_timeout(
+        &client->done,
+        msecs_to_jiffies(KDS_DSHELL_EXEC_TIMEOUT_MS));
+
+    if (wait_ret == 0) {
+        /*
+         * Timed out. Try to cancel: grab the lock, only clear
+         * PENDING if the proc hasn't already picked it up and
+         * started running (it signals done before clearing PENDING
+         * in kds_dshell_proc_run(), so if exec_status is still
+         * PENDING here, the proc hasn't touched it yet).
+         */
+        spin_lock(&kds_dshell_clients_lock);
+        if (client->exec_status == KDS_DSHELL_EXEC_PENDING)
+            client->exec_status = KDS_DSHELL_EXEC_IDLE;
+        spin_unlock(&kds_dshell_clients_lock);
+
+        scnprintf(client->resp_buf, sizeof(client->resp_buf),
+                  "ERR exec timed out after %dms\n",
+                  KDS_DSHELL_EXEC_TIMEOUT_MS);
+        client->resp_len = strnlen(client->resp_buf, sizeof(client->resp_buf));
+        client->resp_pos = 0;
+        return -ETIMEDOUT;
+    }
+
+    return 0;
+}
+
+/*
+ * kds_cmd_insert_row() needs to hand its exec to the proc and then
+ * format the success response once done. This helper wraps that
+ * two-step: run via proc, then let the caller inspect out_tid.
+ * Called from kds_cmd_insert_row() *instead of* the old
+ * while-CONTINUE loop -- the loop now lives inside
+ * kds_dshell_proc_run().
+ */
+static int kds_dshell_submit_insert_exec(kds_dshell_client_t *client,
+                                          kds_heap_insert_exec_t *exec_init)
+{
+    BUILD_BUG_ON(sizeof(*exec_init) > KDS_DSHELL_EXEC_BUF_SIZE);
+    memcpy(client->exec_buf, exec_init, sizeof(*exec_init));
+    return kds_dshell_run_exec_via_proc(client);
+}
+
 static ssize_t kds_dshell_write(struct file *filp, const char __user *ubuf,
                                  size_t len, loff_t *off)
 {
     kds_dshell_client_t *client = filp->private_data;
-    kds_dshell_request_t *req;
+    char cmd_buf[DSHELL_LINE_MAX];
+    char *argv[DSHELL_MAX_ARGS];
     size_t n;
-    long wait_ret;
+    int argc;
 
     if (!client)
         return -EINVAL;
 
-    req = kzalloc(sizeof(*req), GFP_KERNEL);
-    if (!req)
-        return -ENOMEM;
-
-    n = min(len, sizeof(req->cmd_buf) - 1);
-
-    if (copy_from_user(req->cmd_buf, ubuf, n)) {
-        kfree(req);
+    n = min(len, sizeof(cmd_buf) - 1);
+    if (copy_from_user(cmd_buf, ubuf, n))
         return -EFAULT;
-    }
-    req->cmd_buf[n] = '\0';
+    cmd_buf[n] = '\0';
 
-    kref_init(&req->kref);          /* refcount = 1, this call's reference */
-    init_completion(&req->done);
-    INIT_LIST_HEAD(&req->queue_node);
+    /* Reset response staging for this new command. */
+    client->resp_buf[0] = '\0';
+    client->resp_len = 0;
+    client->resp_pos = 0;
 
-    kref_get(&req->kref);            /* refcount = 2, the queue/consumer's reference */
-    spin_lock(&kds_dshell_queue_lock);
-    list_add_tail(&req->queue_node, &kds_dshell_queue);
-    spin_unlock(&kds_dshell_queue_lock);
-
-    wait_ret = wait_for_completion_timeout(&req->done,
-                    msecs_to_jiffies(KDS_DSHELL_REQUEST_TIMEOUT_MS));
-
-    if (wait_ret == 0) {
-        /* Timed out. Try to cancel by removing it from the queue
-         * ourselves -- only safe if it's still sitting there
-         * untouched. */
-        bool still_queued;
-
-        spin_lock(&kds_dshell_queue_lock);
-        still_queued = !list_empty(&req->queue_node);
-        if (still_queued)
-            list_del_init(&req->queue_node);
-        spin_unlock(&kds_dshell_queue_lock);
-
-        if (still_queued) {
-            /* We successfully cancelled it -- drop the queue's
-             * reference ourselves, since kds_dshell_proc_run() will
-             * never see this request now. */
-            kref_put(&req->kref, kds_dshell_request_release);
-        }
-        /* Either way, do not touch req->resp_buf -- if it wasn't
-         * still queued, kds_dshell_proc_run() dequeued it sometime
-         * between our timeout firing and this check, and may be
-         * writing into it right now. */
-
+    argc = kds_split_cmd(cmd_buf, argv, DSHELL_MAX_ARGS);
+    if (argc < 0) {
         scnprintf(client->resp_buf, sizeof(client->resp_buf),
-                  "ERR request timed out after %dms waiting for dshell scheduler\n",
-                  KDS_DSHELL_REQUEST_TIMEOUT_MS);
+                  "ERR failed to parse command\n");
     } else {
-        memcpy(client->resp_buf, req->resp_buf, sizeof(client->resp_buf));
+        __kds_dispatch_dshell_cmd(client, argv, argc,
+                                   client->resp_buf, sizeof(client->resp_buf));
     }
-
-    kref_put(&req->kref, kds_dshell_request_release); /* drop this call's reference */
 
     client->resp_len = strnlen(client->resp_buf, sizeof(client->resp_buf));
     client->resp_pos = 0;
 
-    return len;
+    return (ssize_t)len;
 }
 
 static ssize_t kds_dshell_read(struct file *filp, char __user *ubuf,
@@ -906,7 +1052,7 @@ static ssize_t kds_dshell_read(struct file *filp, char __user *ubuf,
         return -EFAULT;
 
     client->resp_pos += n;
-    return n;
+    return (ssize_t)n;
 }
 
 static const struct file_operations kds_dshell_fops = {
@@ -932,13 +1078,13 @@ static int kds_register_dshell_proc(void)
     if (!kds_dshell_proc)
         return -ENOMEM;
 
-    kds_dshell_proc->kind = KDS_PROC_SYSTEM;
-    kds_dshell_proc->name = "kds_dshell_proc";
-    kds_dshell_proc->static_prio = -1;
-    kds_dshell_proc->dynamic_prio = KDS_PROC_PRIORITY_SYSTEM_BACKGROUND;
-    kds_dshell_proc->run = kds_dshell_proc_run;
-    kds_dshell_proc->ctx = NULL;
-    kds_dshell_proc->state = KDS_PROC_STATE_READY;
+    kds_dshell_proc->kind          = KDS_PROC_SYSTEM;
+    kds_dshell_proc->name          = "kds_dshell_proc";
+    kds_dshell_proc->static_prio   = -1;
+    kds_dshell_proc->dynamic_prio  = KDS_PROC_PRIORITY_SYSTEM_BACKGROUND;
+    kds_dshell_proc->run           = kds_dshell_proc_run;
+    kds_dshell_proc->ctx           = NULL;
+    kds_dshell_proc->state         = KDS_PROC_STATE_READY;
 
     ret = kds_proc_register(kds_dshell_proc);
     if (ret) {
@@ -1017,8 +1163,7 @@ int kds_init_dshell_system(void)
 
 void kds_shutdown_dshell_system(void)
 {
-    kds_dshell_request_t *req, *tmp;
-    LIST_HEAD(local_queue);
+    kds_dshell_client_t *client;
 
     if (!kds_dshell_inited)
         return;
@@ -1026,13 +1171,10 @@ void kds_shutdown_dshell_system(void)
     device_destroy(kds_dshell_class, kds_dshell_devt);
 
     /*
-     * Unregister the proc BEFORE draining the queue -- once this
+     * Unregister the proc first -- once kds_proc_unregister()
      * returns, the scheduler will never call kds_dshell_proc_run()
-     * again, so anything still on the queue at this point is
-     * guaranteed to stay untouched by it. Without this ordering, a
-     * concurrent schedule() on another CPU could still be draining
-     * the queue while we're also draining it below -- two drainers
-     * racing on the same list.
+     * again, so no new complete() calls will arrive. Then wake any
+     * write() still blocked on client->done with a shutdown error.
      */
     if (kds_dshell_proc) {
         kds_proc_unregister(kds_dshell_proc);
@@ -1040,22 +1182,16 @@ void kds_shutdown_dshell_system(void)
         kds_dshell_proc = NULL;
     }
 
-    /*
-     * Wake up any writer still blocked in wait_for_completion_timeout()
-     * with an explicit shutdown error, instead of making them wait
-     * out the full timeout during module removal.
-     */
-    spin_lock(&kds_dshell_queue_lock);
-    list_splice_init(&kds_dshell_queue, &local_queue);
-    spin_unlock(&kds_dshell_queue_lock);
-
-    list_for_each_entry_safe(req, tmp, &local_queue, queue_node) {
-        list_del_init(&req->queue_node);
-        scnprintf(req->resp_buf, sizeof(req->resp_buf),
-                  "ERR dshell shutting down\n");
-        complete(&req->done);
-        kref_put(&req->kref, kds_dshell_request_release);
+    spin_lock(&kds_dshell_clients_lock);
+    list_for_each_entry(client, &kds_dshell_clients, node) {
+        if (client->exec_status == KDS_DSHELL_EXEC_PENDING) {
+            client->exec_status = KDS_DSHELL_EXEC_IDLE;
+            scnprintf(client->resp_buf, sizeof(client->resp_buf),
+                      "ERR dshell shutting down\n");
+            complete(&client->done);
+        }
     }
+    spin_unlock(&kds_dshell_clients_lock);
 
     class_destroy(kds_dshell_class);
     cdev_del(&kds_dshell_cdev);

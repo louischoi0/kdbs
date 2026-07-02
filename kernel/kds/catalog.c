@@ -418,6 +418,8 @@ int kds_catalog_create_table(kd_oid_t namespace_oid, const char *name,
     if (!name || !schema || !out_oid)
         return -EINVAL;
 
+    pr_info("create table namespace_oid=%d, name=%s, clustered_type=%d \n", namespace_oid, name, clustered_type);
+
     if (clustered_type == KDS_CLUSTERED_HEAP) {
         table_root = kds_page_alloc(KDS_PAGE_TYPE_HEAP);
         if (!table_root)
@@ -425,6 +427,7 @@ int kds_catalog_create_table(kd_oid_t namespace_oid, const char *name,
         heap_init_page(table_root);
     } else if (clustered_type == KDS_CLUSTERED_BTREE) {
         table_root = kds_page_alloc(KDS_PAGE_TYPE_BTREE_ROOT);
+        pr_info("kds_page_alloc failed\n");
         if (!table_root)
             return -ENOSPC;
         btree_init_root_kpage(table_root);

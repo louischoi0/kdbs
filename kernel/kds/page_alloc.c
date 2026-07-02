@@ -71,6 +71,14 @@ static inline void unlock_g_alloc(void)
  * around blocking work (disk I/O). Every caller below that does I/O
  * does so *before* taking the lock, then takes the lock only for the
  * pointer-shuffling itself.
+ *
+ * Index convention: cursor and reserved are monotonically increasing
+ * counters, never wrapped. The actual array slot is always accessed
+ * as ring[cursor % SIZE] or ring[reserved % SIZE]. This eliminates
+ * the classic full-vs-empty ambiguity that the previous
+ * (cursor > reserved ? ...) formula had: cursor == reserved is
+ * unambiguously empty (0 items), and reserved - cursor == SIZE is
+ * unambiguously full. No sentinel slot wasted, no extra field needed.
  */
 
 static inline u64 kds_ring_free_slots(void)
@@ -80,15 +88,13 @@ static inline u64 kds_ring_free_slots(void)
 
 static void kds_put_page_into_reserved(kds_frame_t *frame)
 {
-    g_alloc->ring[g_alloc->reserved] = frame;
-    g_alloc->reserved = (g_alloc->reserved + 1) % PRE_ALLOC_RING_BUFFER_SIZE;
+    g_alloc->ring[g_alloc->reserved % PRE_ALLOC_RING_BUFFER_SIZE] = frame;
+    g_alloc->reserved++;
 }
 
 u64 kds_get_pre_alloc_count(void)
 {
-    return (g_alloc->cursor > g_alloc->reserved
-                ? g_alloc->reserved + PRE_ALLOC_RING_BUFFER_SIZE
-                : g_alloc->reserved) - g_alloc->cursor;
+    return g_alloc->reserved - g_alloc->cursor;
 }
 
 kds_tiny_t kds_get_alloc_phase(void)
@@ -113,9 +119,9 @@ kds_frame_t *kds_get_reserved_kpage(kds_page_type_t type)
         return NULL;
     }
 
-    frame = g_alloc->ring[g_alloc->cursor];
-    g_alloc->ring[g_alloc->cursor] = NULL;
-    g_alloc->cursor = (g_alloc->cursor + 1) % PRE_ALLOC_RING_BUFFER_SIZE;
+    frame = g_alloc->ring[g_alloc->cursor % PRE_ALLOC_RING_BUFFER_SIZE];
+    g_alloc->ring[g_alloc->cursor % PRE_ALLOC_RING_BUFFER_SIZE] = NULL;
+    g_alloc->cursor++;
 
     unlock_g_alloc();
 
@@ -472,49 +478,129 @@ int __kds_create_proc_prealloc(void)
 }
 
 /*
- * Initial synchronous fill, separate from the background
- * kds_proc_prealloc refill cycle: without this, the ring starts
- * completely empty and stays that way until the cooperative
- * scheduler happens to run kds_prealloc_proc at least once -- which
- * depends on worker kthreads having started and kds_bootstrap()
- * having already completed, neither of which is synchronized with
- * anything a caller of kds_page_alloc()/kds_get_reserved_kpage()
- * can observe. In particular, the userspace TCP server (kds_init.c)
- * starts and logs "listening" completely independently of this
- * kernel module's own boot progress -- a client request arriving
- * right after that log line has no guarantee the ring has been
- * touched yet at all. This fill makes kds_page_alloc() usable
- * immediately once kds_init_page_alloc_system() returns, instead of
- * depending on scheduler timing.
+ * Loads pages from the id range that was persisted at the previous
+ * clean shutdown ([alloc_point, alloc_point + remaining)) into the
+ * pre-allocation ring, up to `want` slots. These ids were already
+ * advanced past max_page_id at the previous boot -- the pages exist
+ * on disk and just need to be pulled into the buffer pool via
+ * kds_buf_lookup_or_load() rather than freshly allocated.
+ *
+ * Returns the number of pages successfully staged.
+ *
+ * Called only from kds_init_page_alloc_system(), before the
+ * background prealloc proc starts, so there is no concurrent
+ * kds_alloc_next_id() / kds_alloc_pages() touching g_alloc->remaining
+ * or g_alloc->alloc_point here -- no range_lock needed around the
+ * outer loop (we take it only for the atomic decrement of remaining
+ * as we consume each id, mirroring kds_alloc_next_id()'s discipline).
+ *
+ * Pages that fail to load (I/O error, not found on disk) are skipped;
+ * their ids are put onto the freelist so the background proc can retry
+ * them later via kds_alloc_pages()'s freelist-first path.
  */
+static kds_size_t kds_recover_persisted_range(kds_size_t want)
+{
+    kds_size_t got = 0;
+
+    while (got < want) {
+        kds_page_id_t id;
+        kds_frame_t *frame;
+
+        lock_g_alloc_range();
+        if (g_alloc->remaining == 0) {
+            unlock_g_alloc_range();
+            break;
+        }
+        id = g_alloc->alloc_point++;
+        g_alloc->remaining--;
+        unlock_g_alloc_range();
+
+        /*
+         * kds_buf_lookup_or_load(): the page at `id` already exists
+         * on disk (it was written at the previous boot's
+         * kds_alloc_pages() call) -- load it into the buffer pool
+         * without re-initialising or re-writing it.
+         */
+        frame = kds_buf_lookup_or_load(id);
+        if (IS_ERR(frame)) {
+            pr_warn("kds_page_alloc: recover: failed to load persisted page %llu (%ld), "
+                    "adding to freelist\n", (u64)id, PTR_ERR(frame));
+            kds_add_kpage_freelist(id);
+            continue;
+        }
+
+        lock_g_alloc();
+        kds_put_page_into_reserved(frame);
+        unlock_g_alloc();
+        got++;
+    }
+
+    return got;
+}
+
 #define KDS_PAGE_ALLOC_INITIAL_FILL  PRE_ALLOC_RING_BUFFER_SIZE
 
 int kds_init_page_alloc_system(void)
 {
     int ret;
+    kds_size_t filled = 0;
+    kds_size_t want = KDS_PAGE_ALLOC_INITIAL_FILL;
+    u64 persisted_remaining;
 
     kds_init_g_alloc();
-    /* collect_pre_allocated_pages(); -- left disabled, as before:
-     * scanning every page_id on every boot doesn't scale once the
-     * id space is large. Revisit once free-space tracking exists. */
 
-    ret = kds_alloc_pages(KDS_PAGE_ALLOC_INITIAL_FILL);
-    if (ret) {
-        /*
-         * Not necessarily fatal to overall bootstrap -- the
-         * background proc registered below will keep retrying on
-         * every schedule -- but worth surfacing loudly, since every
-         * kds_page_alloc() call between now and the first successful
-         * background refill will fail with the same symptom this
-         * fill exists to prevent.
-         */
-        pr_warn("kds_page_alloc: initial ring fill failed (%d) -- "
-                "kds_page_alloc() may return NULL until the background "
-                "prealloc proc successfully refills it\n", ret);
-    } else {
-        pr_info("kds_page_alloc: initial ring fill complete (%llu page(s) staged)\n",
-                kds_get_pre_alloc_count());
+    /*
+     * Phase 1: recover pages from the previous boot's persisted id
+     * range ([alloc_point, alloc_point + remaining)) without
+     * allocating any new ids. kds_init_g_alloc() already loaded
+     * alloc_point/remaining from the superblock via
+     * kds_meta_get_alloc_range(), so g_alloc->remaining > 0 here iff
+     * the previous shutdown was clean and left unused pre-allocated
+     * ids behind.
+     *
+     * We snapshot remaining before touching it so the log line below
+     * can report how many ids were available to recover.
+     */
+    lock_g_alloc_range();
+    persisted_remaining = g_alloc->remaining;
+    unlock_g_alloc_range();
+
+    if (persisted_remaining > 0) {
+        kds_size_t recover_count = min_t(kds_size_t,
+                                          (kds_size_t)persisted_remaining,
+                                          want);
+
+        filled = kds_recover_persisted_range(recover_count);
+        pr_info("kds_page_alloc: recovered %zu/%llu persisted page(s) "
+                "from previous boot (no new ids allocated)\n",
+                filled, persisted_remaining);
     }
+
+    /*
+     * Phase 2: only allocate new pages if recovery didn't fill the
+     * ring. This is the path taken on first-ever boot (no persisted
+     * range), after a crash (remaining may be 0 or the ids may be
+     * unreadable), or if the ring needs more pages than recovery
+     * could supply.
+     */
+    if (filled < want) {
+        kds_size_t need = want - filled;
+
+        ret = kds_alloc_pages(need);
+        if (ret) {
+            pr_warn("kds_page_alloc: initial new-page fill failed (%d) for %zu page(s) -- "
+                    "kds_page_alloc() may return NULL until the background "
+                    "prealloc proc successfully refills it\n", ret, need);
+        } else {
+            pr_info("kds_page_alloc: allocated %zu new page(s) to top up ring\n", need);
+        }
+    } else {
+        pr_info("kds_page_alloc: ring fully satisfied from persisted range, "
+                "no new pages allocated\n");
+    }
+
+    pr_info("kds_page_alloc: initial ring fill complete (%llu page(s) staged)\n",
+            kds_get_pre_alloc_count());
 
     return __kds_create_proc_prealloc();
 }
@@ -542,6 +628,8 @@ void kds_shutdown_page_alloc_system(void)
     struct kds_free_page_node *node, *tmp;
     kds_page_id_t persist_point;
     u64 persist_remaining;
+    u64 ring_count;
+    kds_page_id_t ring_min_id;
 
     if (kds_prealloc_proc) {
         kds_proc_unregister(kds_prealloc_proc);
@@ -553,30 +641,85 @@ void kds_shutdown_page_alloc_system(void)
         return;
 
     /*
-     * Snapshot the range now, while we still hold range_lock and
-     * nothing else can be drawing from it -- the prealloc proc was
-     * already unregistered above, and main.c only calls this after
-     * stopping every worker kthread, so there is no concurrent
-     * kds_alloc_next_id() caller left at this point. This is exactly
-     * the "clean shutdown" condition kds_meta_set_alloc_range()'s
-     * crash-safety reasoning depends on: persist below is safe
-     * because we know for certain no id in [persist_point,
-     * persist_point + persist_remaining) will be handed out by this
-     * exiting instance.
+     * Snapshot the range counter (alloc_point/remaining) first.
+     * Then scan the ring to find the lowest page_id staged there --
+     * those pages were allocated (kds_buf_alloc_new'd and written)
+     * but never handed out to a caller. Rather than abandoning them,
+     * we extend the persisted range to cover them so the next boot's
+     * kds_recover_persisted_range() can reload them via
+     * kds_buf_lookup_or_load() instead of minting new ids.
+     *
+     * The ring's ids form a contiguous sub-range of the previous
+     * alloc_page_id_batch() output immediately below alloc_point
+     * (kds_alloc_pages() mints them in order and the ring is a FIFO,
+     * so the lowest-id page in the ring is the one minted earliest).
+     * We find that lowest id by walking the ring, then set
+     * persist_point = min_ring_id and persist_remaining = (alloc_point
+     * + remaining) - min_ring_id so the next boot gets the full
+     * [min_ring_id, alloc_point + remaining) window.
+     *
+     * No range_lock is needed here: the prealloc proc was already
+     * unregistered above (so kds_alloc_next_id() can't race us), and
+     * main.c calls this only after stopping every worker kthread.
      */
     lock_g_alloc_range();
-    persist_point = g_alloc->alloc_point;
+    persist_point     = g_alloc->alloc_point;
     persist_remaining = g_alloc->remaining;
     unlock_g_alloc_range();
+
+    /*
+     * Walk the ring to find the minimum page_id. The ring is a
+     * circular FIFO; we read every occupied slot without advancing
+     * cursor so the drain loop below still works normally.
+     */
+    lock_g_alloc();
+    ring_count  = kds_get_pre_alloc_count();
+    ring_min_id = (persist_point + persist_remaining); /* sentinel: nothing in ring */
+
+    if (ring_count > 0) {
+        u64 i;
+
+        for (i = 0; i < ring_count; i++) {
+            kds_frame_t *rf = g_alloc->ring[(g_alloc->cursor + i) % PRE_ALLOC_RING_BUFFER_SIZE];
+
+            if (rf && rf->kp) {
+                kds_page_id_t rid = rf->kp->id;
+
+                if (rid < ring_min_id)
+                    ring_min_id = rid;
+            }
+        }
+
+        /*
+         * Extend the persisted window back to cover ring pages.
+         * persist_point + persist_remaining is the exclusive upper
+         * bound of the entire pre-allocated id space; setting
+         * persist_point = ring_min_id extends the window downward
+         * to include the ring's ids without changing the upper bound.
+         */
+        if (ring_min_id < persist_point) {
+            persist_remaining += (persist_point - ring_min_id);
+            persist_point      = ring_min_id;
+        }
+    }
+    unlock_g_alloc();
 
     kds_meta_set_alloc_range(persist_point, persist_remaining);
     kds_superblock_fsync();
 
+    pr_info("kds_page_alloc: persisting range [%llu, %llu) "
+            "(%llu unused pre-alloc id(s) + %llu ring page(s)) for next boot\n",
+            (u64)persist_point,
+            (u64)(persist_point + persist_remaining),
+            g_alloc->remaining,
+            ring_count);
+
+    /* Drain and unpin every frame still in the ring. */
     lock_g_alloc();
     while (kds_get_pre_alloc_count() > 0) {
-        frame = g_alloc->ring[g_alloc->cursor];
-        g_alloc->ring[g_alloc->cursor] = NULL;
-        g_alloc->cursor = (g_alloc->cursor + 1) % PRE_ALLOC_RING_BUFFER_SIZE;
+        frame = g_alloc->ring[g_alloc->cursor % PRE_ALLOC_RING_BUFFER_SIZE];
+        g_alloc->ring[g_alloc->cursor % PRE_ALLOC_RING_BUFFER_SIZE] = NULL;
+        g_alloc->cursor++;
 
         if (frame)
             kds_buf_unpin(frame);
@@ -594,10 +737,6 @@ void kds_shutdown_page_alloc_system(void)
 
     kfree(g_alloc);
     g_alloc = NULL;
-
-    pr_info("kds_page_alloc: shutdown complete, persisted alloc range "
-            "[%llu, %llu) for next boot\n",
-            (u64)persist_point, (u64)(persist_point + persist_remaining));
 }
 
 void kds_page_alloc_get_stats(kds_page_id_t *out_alloc_point, u64 *out_alloc_remaining,
