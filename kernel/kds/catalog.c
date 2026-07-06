@@ -41,9 +41,16 @@ void kds_catalog_register_sys_object(const kds_sys_object_t *obj)
 
     if (g_sys_objects_count >= KDS_CATALOG_MAX_SYS_OBJECTS) {
         spin_unlock_irqrestore(&g_sys_objects_lock, flags);
-        pr_err("kds_catalog: sys object registry full (cap=%d), dropped oid=%llu name=%s\n",
-               KDS_CATALOG_MAX_SYS_OBJECTS, obj->oid, obj->name);
-        return;
+        /*
+         * The well-known-object registry is a fixed-size compile-time
+         * constant. Overflowing it means KDS_CATALOG_MAX_SYS_OBJECTS
+         * is too small for the objects kds_catalog_init_well_known_objects()
+         * registers -- this is a developer error, not a runtime condition,
+         * so a panic is appropriate.
+         */
+        panic("KDS: sys-object registry overflow (cap=%d) -- "
+              "increase KDS_CATALOG_MAX_SYS_OBJECTS (oid=%llu name=%s)\n",
+              KDS_CATALOG_MAX_SYS_OBJECTS, obj->oid, obj->name);
     }
 
     g_sys_objects[g_sys_objects_count++] = *obj;
@@ -199,8 +206,10 @@ int kds_catalog_insert_object_row(kd_oid_t oid, kd_oid_t namespace_oid,
     int ret;
 
     frame = kds_buf_lookup_or_load(KDS_CATALOG_PAGE_OBJECTS);
+    pr_debug("lookup\n");
     if (IS_ERR(frame))
         return PTR_ERR(frame);
+    pr_debug("ok\n");
 
     row.oid = oid;
     row.namespace_oid = namespace_oid;
@@ -223,6 +232,8 @@ int kds_catalog_insert_relation_row(kd_oid_t oid, kd_oid_t namespace_oid,
     int ret;
 
     frame = kds_buf_lookup_or_load(KDS_CATALOG_PAGE_TABLES);
+    pr_debug("kds_catalog: insert_relation_row: lookup page %d → %s\n",
+             KDS_CATALOG_PAGE_TABLES, IS_ERR(frame) ? "ERR" : "OK");
     if (IS_ERR(frame))
         return PTR_ERR(frame);
 
@@ -234,6 +245,10 @@ int kds_catalog_insert_relation_row(kd_oid_t oid, kd_oid_t namespace_oid,
 
     ret = heap_insert_tuple(frame, &row, sizeof(row), KDS_BOOTSTRAP_XID, &tid);
     kds_buf_unpin(frame);
+
+    pr_debug("kds_catalog: insert_relation_row: oid=%llu namespace_oid=%llu ret=%d\n",
+             (u64)oid, (u64)namespace_oid, ret);
+
     return ret;
 }
 
@@ -284,80 +299,86 @@ static int insert_sys_type_row(kd_oid_t oid, const char *name, u32 type_val, u32
     return ret;
 }
 
+/*
+ * Bootstrap panic helper.
+ *
+ * Called on any failure inside kds_catalog_bootstrap(). The catalog
+ * system tables are a hard precondition for every subsequent KDS
+ * operation -- a partially-initialised catalog is worse than no
+ * catalog at all, since it will cause silent data corruption or
+ * assertion failures deep inside unrelated code paths. Panicking
+ * immediately with a clear message is the only safe response.
+ */
+#define KDS_BOOTSTRAP_PANIC(fmt, ...) \
+    panic("KDS: catalog bootstrap FATAL: " fmt "\n", ##__VA_ARGS__)
+
 int kds_catalog_bootstrap(void)
 {
     static const struct {
-        kd_oid_t    oid;
-        const char  *name;
+        kd_oid_t      oid;
+        const char   *name;
+        kds_page_id_t page_id;
     } sys_tables[] = {
-        { KDS_OID_SYS_TYPES_TABLE,   "types"   },
-        { KDS_OID_SYS_OBJECTS_TABLE, "objects" },
-        { KDS_OID_SYS_COLUMNS_TABLE, "columns" },
-        { KDS_OID_SYS_TABLES_TABLE,  "tables"  },
+        { KDS_OID_SYS_TYPES_TABLE,   "types",   KDS_CATALOG_PAGE_TYPES   },
+        { KDS_OID_SYS_OBJECTS_TABLE, "objects", KDS_CATALOG_PAGE_OBJECTS },
+        { KDS_OID_SYS_COLUMNS_TABLE, "columns", KDS_CATALOG_PAGE_COLUMNS },
+        { KDS_OID_SYS_TABLES_TABLE,  "tables",  KDS_CATALOG_PAGE_TABLES  },
     };
     int ret;
     u32 i;
 
     kds_catalog_init_well_known_objects();
 
-    ret = bootstrap_one_catalog_page(KDS_CATALOG_PAGE_TYPES);
-    if (ret)
-        return ret;
-    ret = bootstrap_one_catalog_page(KDS_CATALOG_PAGE_OBJECTS);
-    if (ret)
-        return ret;
-    ret = bootstrap_one_catalog_page(KDS_CATALOG_PAGE_COLUMNS);
-    if (ret)
-        return ret;
-    ret = bootstrap_one_catalog_page(KDS_CATALOG_PAGE_TABLES);
-    if (ret)
-        return ret;
-
-    /* sys.objects rows for the four catalog tables themselves. */
+    /* ----------------------------------------------------------
+     * Phase 1: allocate the four fixed catalog heap pages.
+     * ---------------------------------------------------------- */
     for (i = 0; i < ARRAY_SIZE(sys_tables); i++) {
-        ret = kds_catalog_insert_object_row(sys_tables[i].oid, KDS_OID_NAMESPACE_SYS,
-                                     KDS_OID_TYPE_TABLE, sys_tables[i].name);
-        if (ret) {
-            pr_err("kds_catalog: failed to insert sys.objects row for %s: %d\n",
-                   sys_tables[i].name, ret);
-            return ret;
-        }
+        ret = bootstrap_one_catalog_page(sys_tables[i].page_id);
+        if (ret)
+            KDS_BOOTSTRAP_PANIC(
+                "failed to allocate catalog page %llu ('%s'): %d",
+                (u64)sys_tables[i].page_id, sys_tables[i].name, ret);
     }
 
-    /* sys.tables rows -- all four are heap-clustered by convention,
-     * same as catalog.py's bootstrap. */
+    /* ----------------------------------------------------------
+     * Phase 2: sys.objects rows for the four catalog tables.
+     * ---------------------------------------------------------- */
     for (i = 0; i < ARRAY_SIZE(sys_tables); i++) {
-        kds_page_id_t desc;
-
-        switch (sys_tables[i].oid) {
-        case KDS_OID_SYS_TYPES_TABLE:   desc = KDS_CATALOG_PAGE_TYPES; break;
-        case KDS_OID_SYS_OBJECTS_TABLE: desc = KDS_CATALOG_PAGE_OBJECTS; break;
-        case KDS_OID_SYS_COLUMNS_TABLE: desc = KDS_CATALOG_PAGE_COLUMNS; break;
-        case KDS_OID_SYS_TABLES_TABLE:  desc = KDS_CATALOG_PAGE_TABLES; break;
-        default:                        desc = 0; break;
-        }
-
-        ret = kds_catalog_insert_relation_row(sys_tables[i].oid, KDS_OID_NAMESPACE_SYS,
-                                    sys_tables[i].name, desc, KDS_CLUSTERED_HEAP);
-        if (ret) {
-            pr_err("kds_catalog: failed to insert sys.tables row for %s: %d\n",
-                   sys_tables[i].name, ret);
-            return ret;
-        }
+        ret = kds_catalog_insert_object_row(sys_tables[i].oid,
+                                             KDS_OID_NAMESPACE_SYS,
+                                             KDS_OID_TYPE_TABLE,
+                                             sys_tables[i].name);
+        if (ret)
+            KDS_BOOTSTRAP_PANIC(
+                "failed to insert sys.objects row for '%s': %d",
+                sys_tables[i].name, ret);
     }
 
-    /*
-     * sys.types rows for the well-known scalar types -- type_val/len
-     * are pulled from the kds_types.h registry instead of being
-     * hardcoded here a second time. Only the oid (catalog identity)
-     * and the registry lookup name need to be listed; adding a new
-     * type to kds_types.h's table does NOT require touching this
-     * list too unless it should also get a sys.types bootstrap row.
-     */
+    /* ----------------------------------------------------------
+     * Phase 3: sys.tables rows for the four catalog tables.
+     * ---------------------------------------------------------- */
+    for (i = 0; i < ARRAY_SIZE(sys_tables); i++) {
+        ret = kds_catalog_insert_relation_row(sys_tables[i].oid,
+                                               KDS_OID_NAMESPACE_SYS,
+                                               sys_tables[i].name,
+                                               sys_tables[i].page_id,
+                                               KDS_CLUSTERED_HEAP);
+        if (ret)
+            KDS_BOOTSTRAP_PANIC(
+                "failed to insert sys.tables row for '%s': %d",
+                sys_tables[i].name, ret);
+    }
+
+    /* ----------------------------------------------------------
+     * Phase 4: sys.types rows for the well-known scalar types.
+     * type_val/len are pulled from the kds_types.h registry so
+     * adding a new type there does NOT require touching this list
+     * unless it also needs a sys.types bootstrap row.
+     * ---------------------------------------------------------- */
     {
         static const struct {
             kd_oid_t    oid;
-            const char  *type_name;   /* kds_types.h registry name */
+            const char *type_name;
         } types[] = {
             { KDS_OID_TYPE_INT8,    "int8"    },
             { KDS_OID_TYPE_INT16,   "int16"   },
@@ -371,20 +392,21 @@ int kds_catalog_bootstrap(void)
         };
 
         for (i = 0; i < ARRAY_SIZE(types); i++) {
-            const kds_type_desc_t *desc = kds_type_lookup_by_name(types[i].type_name);
+            const kds_type_desc_t *desc =
+                kds_type_lookup_by_name(types[i].type_name);
 
-            if (!desc) {
-                pr_err("kds_catalog: no type descriptor for '%s' (bug: kds_types.h registry mismatch)\n",
-                       types[i].type_name);
-                return -EINVAL;
-            }
+            if (!desc)
+                KDS_BOOTSTRAP_PANIC(
+                    "no type descriptor for '%s' -- "
+                    "kds_types.h registry is out of sync with catalog.c",
+                    types[i].type_name);
 
-            ret = insert_sys_type_row(types[i].oid, desc->name, desc->type_val, desc->fixed_len);
-            if (ret) {
-                pr_err("kds_catalog: failed to insert sys.types row for %s: %d\n",
-                       desc->name, ret);
-                return ret;
-            }
+            ret = insert_sys_type_row(types[i].oid, desc->name,
+                                       desc->type_val, desc->fixed_len);
+            if (ret)
+                KDS_BOOTSTRAP_PANIC(
+                    "failed to insert sys.types row for '%s': %d",
+                    desc->name, ret);
         }
     }
 
@@ -427,9 +449,10 @@ int kds_catalog_create_table(kd_oid_t namespace_oid, const char *name,
         heap_init_page(table_root);
     } else if (clustered_type == KDS_CLUSTERED_BTREE) {
         table_root = kds_page_alloc(KDS_PAGE_TYPE_BTREE_ROOT);
-        pr_info("kds_page_alloc failed\n");
-        if (!table_root)
+        if (!table_root) {
             return -ENOSPC;
+        }
+
         btree_init_root_kpage(table_root);
         /*
          * NOTE: a freshly initialized btree root has no leaf
@@ -449,6 +472,7 @@ int kds_catalog_create_table(kd_oid_t namespace_oid, const char *name,
 
     ret = kds_catalog_insert_object_row(new_oid, namespace_oid, KDS_OID_TYPE_TABLE, name);
     if (ret) {
+        pr_debug("catalog insert obj row failed errno=%d\n", ret);
         kds_buf_unpin(table_root);
         return ret;
     }
@@ -456,6 +480,7 @@ int kds_catalog_create_table(kd_oid_t namespace_oid, const char *name,
     ret = kds_catalog_insert_relation_row(new_oid, namespace_oid, name,
                                 table_root->kp->id, clustered_type);
     if (ret) {
+        pr_info("catalog insert rel row failed errno=%d\n", ret);
         kds_buf_unpin(table_root);
         return ret;
     }

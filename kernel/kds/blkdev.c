@@ -1,3 +1,4 @@
+#include <linux/kernel.h>
 #include <linux/kds.h>
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
@@ -377,7 +378,12 @@ int kds_write_logical_page(sector_t sector, struct page *head_page)
     for (i = 0; i < KDS_PAGE_NR_BASE_PAGES; i++)
         pages[i] = nth_page(head_page, i);
 
-    return kds_write_extent(sector, pages, KDS_PAGE_NR_BASE_PAGES);
+    int ret = kds_write_extent(sector, pages, KDS_PAGE_NR_BASE_PAGES);
+    if (ret != 0) {
+        panic("kds write page failed!");
+    }
+
+    return ret;
 }
 
 int kds_read_extent(

@@ -113,10 +113,50 @@ void btree_init_root_kpage(kds_frame_t* frame);
 void btree_init_data_kpage(kds_frame_t* frame);
 void btree_init_page_data(kds_btree_page_data_t* data);
 void load_btree_node(kds_frame_t *frame, kds_btree_node_t *out);
+void store_btree_node(kds_btree_node_t *node);
+void btree_cursor_init(kds_btree_cursor_t *cursor);
+void btree_cursor_cleanup(kds_btree_cursor_t *cursor);
 int btree_insert(kds_page_id_t root_page_id, kds_tuple_id_t key, kds_page_id_t value_page_id);
 int kds_btree_print(kds_frame_t *root_frame);
 void print_btree_node(kds_btree_node_t *node);
 void load_btree_node_data(kds_frame_t *frame, kds_btree_page_data_t *out);
+
+/*
+ * Cursor-based insert API -- split from btree_insert() so that the
+ * executor layer (insert_exec.c / executor.c) can drive the two
+ * phases (search and insert) independently, yielding between them
+ * on a scheduler slice boundary without exposing btree internals.
+ *
+ * kds_btree_cursor_search():
+ *   Descends from root_page_id to the leaf that would hold `key`,
+ *   filling *cursor with the path (pinned frames + positions at each
+ *   level). Returns 0 on success (leaf found, no duplicate),
+ *   -EEXIST if `key` already exists, or a negative errno on I/O
+ *   error. On any non-zero return the cursor is already cleaned up
+ *   by this function; the caller must not call btree_cursor_cleanup()
+ *   again.
+ *
+ * kds_btree_cursor_insert():
+ *   Performs the actual leaf insert and any split propagation using
+ *   the cursor filled by kds_btree_cursor_search(). The cursor's
+ *   pinned frames are released inside this call regardless of the
+ *   return value -- the caller must not touch cursor->nodes[*].frame
+ *   after this returns. Returns 0 on success or a negative errno.
+ */
+int kds_btree_cursor_search(kds_btree_cursor_t *cursor,
+                             kds_page_id_t root_page_id,
+                             kds_tuple_id_t key);
+
+int kds_btree_cursor_insert(kds_btree_cursor_t *cursor,
+                             kds_tuple_id_t key,
+                             kds_page_id_t value_page_id);
+
+
+int kds_btree_traverse( kds_frame_t *root_frame, kds_btree_traverse_cb callback, void *private);
+int btree_delete(kds_page_id_t root_page_id, kds_tuple_id_t key);
+void btree_node_insert_at(kds_btree_node_t *node, int pos, kds_tuple_id_t key, kds_page_id_t slot);
+int btree_split_node(kds_btree_node_t *node, kds_btree_split_result_t *result);
+int btree_propagate_split(kds_btree_cursor_t *cursor, kds_btree_split_result_t *split_result);
 
 static inline void print_layout(void)
 {

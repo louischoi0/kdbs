@@ -48,8 +48,10 @@ static void kds_cleanup(void);
 static void kds_bootstrap_failed(const char *stage, int ret)
 {
     pr_err("kds: bootstrap failed at %s: %d\n", stage, ret);
+    pr_debug("kds: bootstrap failed at %s: %d\n", stage, ret);
     atomic_set(&kds_initialized, KDS_INIT_FAILED);
     wake_up(&kds_init_wait);
+    panic("failed");
 }
 
 void kds_bootstrap(void)

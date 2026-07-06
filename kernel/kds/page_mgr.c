@@ -34,12 +34,6 @@ extern struct block_device *kds_bdev;
 
 static kds_buf_pool_t *g_pool;
 
-/* Order of struct page allocation needed to back one KDS_PAGE_SIZE
- * page given the kernel's native PAGE_SIZE (e.g. 8KiB / 4KiB => order 1).
- * Note: the split into individual base pages for I/O is no longer
- * this file's concern -- kds_read_logical_page()/kds_write_logical_page()
- * in blkdev.c own that mapping. This file only needs the order to
- * alloc_pages()/__free_pages() the contiguous backing memory. */
 #define KDS_PAGE_ORDER  get_order(KDS_PAGE_SIZE)
 
 /* ------------------------------------------------------------------
@@ -67,17 +61,6 @@ static const struct rhashtable_params kds_buf_params = {
     .obj_cmpfn      = kds_buf_entry_cmp,
     .automatic_shrinking = true,
 };
-
-/* ------------------------------------------------------------------
- * sector mapping: page_id N starts at sector
- * DATA_PAGE_OFFSET + N * KDS_PAGE_SECTORS -- each page_id step must
- * advance by a full page's worth of sectors (KDS_PAGE_SECTORS), not
- * by 1 sector, or consecutive pages overlap on disk.
- * ------------------------------------------------------------------ */
-static inline sector_t kds_page_sector(kds_page_id_t id)
-{
-    return (sector_t)(DATA_PAGE_OFFSET + id * KDS_PAGE_SECTORS);
-}
 
 /* ------------------------------------------------------------------
  * Lifecycle
@@ -189,17 +172,12 @@ static int kds_frame_read_from_disk(kds_frame_t *f, kds_page_id_t page_id)
     if (!kds_bdev)
         return -ENODEV;
 
-    /* One contiguous allocation covering KDS_PAGE_SIZE, regardless of
-     * how it relates to the kernel's native PAGE_SIZE. */
     page = alloc_pages(GFP_KERNEL, KDS_PAGE_ORDER);
     if (!page)
         return -ENOMEM;
 
     sector = kds_page_sector(page_id);
 
-    /* kds_read_logical_page() (blkdev.c) owns the logical-page ->
-     * base-page splitting; this file no longer builds a struct
-     * page* array or calls kds_read_extent() directly. */
     ret = kds_read_logical_page(sector, page);
     if (ret) {
         __free_pages(page, KDS_PAGE_ORDER);
@@ -218,14 +196,55 @@ static int kds_frame_read_from_disk(kds_frame_t *f, kds_page_id_t page_id)
     atomic64_set(&f->kp->refcnt, 0);
     INIT_LIST_HEAD(&f->kp->node);
 
-    /* Header lives at the start of the page; same convention as
-     * kds_read_page() in page.c. */
     {
         void *addr = kmap_local_page(page);
         memcpy(&f->kp->hdr, addr, KDS_PAGE_HDR_SIZE);
         kunmap_local(addr);
     }
 
+    return 0;
+}
+
+/* ------------------------------------------------------------------
+ * Internal: register a frame into the rhashtable.
+ * Used by both kds_buf_lookup_or_load() and kds_buf_alloc_new().
+ * On failure the caller is responsible for cleaning up f.
+ * ------------------------------------------------------------------ */
+
+static int kds_buf_register_frame(kds_frame_t *f)
+{
+    spinlock_t *plock;
+    struct kds_buf_entry *entry, *new_entry;
+    int ret;
+
+    new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+    if (!new_entry)
+        return -ENOMEM;
+
+    new_entry->page_id  = f->page_id;
+    new_entry->frame_id = f->frame_id;
+
+    plock = kds_buf_partition_lock(g_pool, f->page_id);
+    spin_lock(plock);
+
+    entry = rhashtable_lookup_fast(&g_pool->map, &f->page_id, kds_buf_params);
+    if (entry) {
+        spin_unlock(plock);
+        kfree(new_entry);
+        return -EEXIST;
+    }
+
+    ret = rhashtable_insert_fast(&g_pool->map, &new_entry->node, kds_buf_params);
+    if (ret) {
+        spin_unlock(plock);
+        kfree(new_entry);
+        return ret;
+    }
+
+    f->state = KDS_FRAME_VALID;
+    kds_buf_pin(f);
+
+    spin_unlock(plock);
     return 0;
 }
 
@@ -254,8 +273,6 @@ kds_frame_t *kds_buf_lookup(kds_page_id_t page_id)
 
 kds_frame_t *kds_buf_lookup_or_load(kds_page_id_t page_id)
 {
-    spinlock_t *plock;
-    struct kds_buf_entry *entry, *new_entry;
     kds_frame_t *f;
     int ret;
 
@@ -267,82 +284,56 @@ kds_frame_t *kds_buf_lookup_or_load(kds_page_id_t page_id)
     if (f)
         return f;
 
-    /* Slow path: take a free frame and load from disk. The frame is
-     * not registered in the mapping table yet (state == LOADING), so
-     * concurrent lookups for the same page_id will not see it until
-     * the load completes and it is inserted below. The partition
-     * lock below is what actually serializes concurrent loaders of
-     * the same page_id. */
     f = kds_buf_take_free_frame();
     if (!f)
         return ERR_PTR(-ENOSPC);
 
-    f->state = KDS_FRAME_LOADING;
+    f->state   = KDS_FRAME_LOADING;
     f->page_id = page_id;
 
     ret = kds_frame_read_from_disk(f, page_id);
     if (ret) {
-        f->state = KDS_FRAME_FREE;
+        f->state   = KDS_FRAME_FREE;
         f->page_id = 0;
         kds_buf_return_free_frame(f);
         return ERR_PTR(ret);
     }
 
-    new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
-    if (!new_entry) {
-        if (f->page)
-            __free_pages(f->page, KDS_PAGE_ORDER);
-        vfree(f->kp);
-        f->kp = NULL;
-        f->state = KDS_FRAME_FREE;
-        f->page_id = 0;
-        kds_buf_return_free_frame(f);
-        return ERR_PTR(-ENOMEM);
-    }
-    new_entry->page_id = page_id;
-    new_entry->frame_id = f->frame_id;
-
-    plock = kds_buf_partition_lock(g_pool, page_id);
-    spin_lock(plock);
-
-    /* Re-check under the partition lock: another thread may have
-     * loaded and inserted the same page_id while we were doing our
-     * own disk read above. If so, discard our copy and use theirs. */
-    entry = rhashtable_lookup_fast(&g_pool->map, &page_id, kds_buf_params);
-    if (entry) {
-        spin_unlock(plock);
-        kfree(new_entry);
+    ret = kds_buf_register_frame(f);
+    if (ret == -EEXIST) {
+        /*
+         * Another thread loaded the same page while we were on disk.
+         * Discard our copy and return theirs.
+         */
+        struct kds_buf_entry *entry;
 
         __free_pages(f->page, KDS_PAGE_ORDER);
         vfree(f->kp);
-        f->kp = NULL;
-        f->state = KDS_FRAME_FREE;
+        f->kp      = NULL;
+        f->state   = KDS_FRAME_FREE;
         f->page_id = 0;
         kds_buf_return_free_frame(f);
 
-        f = &g_pool->frames[entry->frame_id];
-        kds_buf_pin(f);
+        rcu_read_lock();
+        entry = rhashtable_lookup(&g_pool->map, &page_id, kds_buf_params);
+        if (entry) {
+            f = &g_pool->frames[entry->frame_id];
+            kds_buf_pin(f);
+        } else {
+            f = ERR_PTR(-ENOENT);
+        }
+        rcu_read_unlock();
         return f;
     }
-
-    ret = rhashtable_insert_fast(&g_pool->map, &new_entry->node, kds_buf_params);
     if (ret) {
-        spin_unlock(plock);
-        kfree(new_entry);
-
         __free_pages(f->page, KDS_PAGE_ORDER);
         vfree(f->kp);
-        f->kp = NULL;
-        f->state = KDS_FRAME_FREE;
+        f->kp      = NULL;
+        f->state   = KDS_FRAME_FREE;
         f->page_id = 0;
         kds_buf_return_free_frame(f);
         return ERR_PTR(ret);
     }
-
-    f->state = KDS_FRAME_VALID;
-    kds_buf_pin(f);
-
-    spin_unlock(plock);
 
     return f;
 }
@@ -357,21 +348,39 @@ void kds_buf_unpin(kds_frame_t *frame)
     atomic64_dec(&frame->kp->refcnt);
 }
 
+/* ------------------------------------------------------------------
+ * kds_buf_alloc_new()
+ *
+ * Allocates a brand-new page for the given page_id:
+ *   1. Takes a free frame from the pool.
+ *   2. Allocates backing memory.
+ *   3. Sets ALLOC | DIRTY flags only -- NOT INIT.
+ *      INIT is set later by heap_init_page() / btree_init_root_kpage()
+ *      etc. when the page is actually claimed for use. This separation
+ *      is what makes page_alloc.c's reclaim scan work correctly:
+ *      ALLOC-but-not-INIT means "pre-allocated but not yet used".
+ *   4. Writes header + zeroed body to disk immediately via
+ *      kds_commit_page_hdr() + kds_write_page(), so the page has
+ *      on-disk presence before being handed to the caller. This removes
+ *      the need for page_alloc.c to call those two functions separately
+ *      after kds_buf_alloc_new() returns.
+ *   5. Registers the frame in the rhashtable and returns it pinned.
+ *
+ * page_alloc.c's kds_batch_alloc() uses this as its sole allocation
+ * primitive and does not need to call kds_commit_page_hdr() or
+ * kds_write_page() itself.
+ * ------------------------------------------------------------------ */
+
 kds_frame_t *kds_buf_alloc_new(kds_page_id_t page_id)
 {
-    spinlock_t *plock;
-    struct kds_buf_entry *entry, *new_entry;
-    kds_frame_t *f;
-    struct page *page;
-    int ret;
+    kds_frame_t  *f;
+    struct page  *page;
+    int           ret;
 
     if (!g_pool)
         return ERR_PTR(-ENODEV);
 
-    /* Reject up front if it's already cached -- allocating a page_id
-     * that's already live indicates a bug in the caller (the
-     * extent/free-space allocator handed out an id that's still in
-     * use), not a benign race to be resolved silently. */
+    /* Up-front check: reject if already cached (caller bug). */
     f = kds_buf_lookup(page_id);
     if (f) {
         kds_buf_unpin(f);
@@ -382,12 +391,12 @@ kds_frame_t *kds_buf_alloc_new(kds_page_id_t page_id)
     if (!f)
         return ERR_PTR(-ENOSPC);
 
-    f->state = KDS_FRAME_LOADING;
+    f->state   = KDS_FRAME_LOADING;
     f->page_id = page_id;
 
     page = alloc_pages(GFP_KERNEL, KDS_PAGE_ORDER);
     if (!page) {
-        f->state = KDS_FRAME_FREE;
+        f->state   = KDS_FRAME_FREE;
         f->page_id = 0;
         kds_buf_return_free_frame(f);
         return ERR_PTR(-ENOMEM);
@@ -396,92 +405,68 @@ kds_frame_t *kds_buf_alloc_new(kds_page_id_t page_id)
     f->kp = vmalloc(sizeof(kds_page_t));
     if (!f->kp) {
         __free_pages(page, KDS_PAGE_ORDER);
-        f->state = KDS_FRAME_FREE;
+        f->state   = KDS_FRAME_FREE;
         f->page_id = 0;
         kds_buf_return_free_frame(f);
         return ERR_PTR(-ENOMEM);
     }
 
-    f->page = page;
-    f->kp->id = page_id;
+    f->page    = page;
+    f->kp->id  = page_id;
     spin_lock_init(&f->kp->lock);
     atomic64_set(&f->kp->refcnt, 0);
     INIT_LIST_HEAD(&f->kp->node);
 
-    /* New page starts out type-less; the caller (e.g.
-     * btree_init_root_kpage()/btree_init_data_kpage()) is expected to
-     * set the real type. DIRTY is set unconditionally so this page is
-     * guaranteed to reach disk even if the caller never marks it
-     * dirty again before it gets flushed/evicted. */
-    f->kp->hdr.type = KDS_PAGE_TYPE_INVALID;
-    f->kp->hdr.crc = 0;
-    f->kp->hdr.flags = KDS_PAGE_FLAG_ALLOC | KDS_PAGE_FLAG_INIT | KDS_PAGE_FLAG_DIRTY;
+    /*
+     * ALLOC: this id has been issued by the allocator.
+     * DIRTY: must reach disk before the frame can be recycled.
+     * NOT INIT: page has no user data yet; page_alloc.c's reclaim
+     *   scan uses the absence of INIT to identify recyclable pages.
+     *   heap_init_page() / btree_init_root_kpage() / etc. set INIT
+     *   when the page is actually claimed for a table or index.
+     */
+    f->kp->hdr.type  = KDS_PAGE_TYPE_INVALID;
+    f->kp->hdr.crc   = 0;
+    f->kp->hdr.flags = KDS_PAGE_FLAG_ALLOC | KDS_PAGE_FLAG_DIRTY;
 
+    /* Zero the page and write the initial header to disk so this
+     * page_id has physical presence before the frame is handed out.
+     * page_alloc.c no longer needs to call kds_commit_page_hdr() or
+     * kds_write_page() separately after this function returns. */
     {
         void *addr = kmap_local_page(page);
-
         memset(addr, 0, KDS_PAGE_SIZE);
         memcpy(addr, &f->kp->hdr, KDS_PAGE_HDR_SIZE);
-
         kunmap_local(addr);
     }
 
-    new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
-    if (!new_entry) {
-        __free_pages(f->page, KDS_PAGE_ORDER);
-        vfree(f->kp);
-        f->kp = NULL;
-        f->page = NULL;
-        f->state = KDS_FRAME_FREE;
-        f->page_id = 0;
-        kds_buf_return_free_frame(f);
-        return ERR_PTR(-ENOMEM);
-    }
-    new_entry->page_id = page_id;
-    new_entry->frame_id = f->frame_id;
-
-    plock = kds_buf_partition_lock(g_pool, page_id);
-    spin_lock(plock);
-
-    /* Re-check under the partition lock: if another caller raced us
-     * and allocated the same page_id in the meantime, that is the
-     * upstream bug described above -- fail loudly rather than
-     * silently merging with their frame. */
-    entry = rhashtable_lookup_fast(&g_pool->map, &page_id, kds_buf_params);
-    if (entry) {
-        spin_unlock(plock);
-        kfree(new_entry);
-
-        __free_pages(f->page, KDS_PAGE_ORDER);
-        vfree(f->kp);
-        f->kp = NULL;
-        f->page = NULL;
-        f->state = KDS_FRAME_FREE;
-        f->page_id = 0;
-        kds_buf_return_free_frame(f);
-
-        return ERR_PTR(-EEXIST);
+    if (kds_bdev) {
+        sector_t sector = kds_page_sector(page_id);
+        ret = kds_write_logical_page(sector, page);
+        if (ret) {
+            __free_pages(page, KDS_PAGE_ORDER);
+            vfree(f->kp);
+            f->kp      = NULL;
+            f->state   = KDS_FRAME_FREE;
+            f->page_id = 0;
+            kds_buf_return_free_frame(f);
+            return ERR_PTR(ret);
+        }
+        /* Header is now on disk; clear DIRTY. */
+        f->kp->hdr.flags &= ~KDS_PAGE_FLAG_DIRTY;
     }
 
-    ret = rhashtable_insert_fast(&g_pool->map, &new_entry->node, kds_buf_params);
+    ret = kds_buf_register_frame(f);
     if (ret) {
-        spin_unlock(plock);
-        kfree(new_entry);
-
         __free_pages(f->page, KDS_PAGE_ORDER);
         vfree(f->kp);
-        f->kp = NULL;
-        f->page = NULL;
-        f->state = KDS_FRAME_FREE;
+        f->kp      = NULL;
+        f->page    = NULL;
+        f->state   = KDS_FRAME_FREE;
         f->page_id = 0;
         kds_buf_return_free_frame(f);
         return ERR_PTR(ret);
     }
-
-    f->state = KDS_FRAME_VALID;
-    kds_buf_pin(f);
-
-    spin_unlock(plock);
 
     return f;
 }
@@ -558,10 +543,6 @@ int kds_frame_flush(kds_frame_t *frame)
 
     sector = kds_page_sector(frame->page_id);
 
-    /* Header may have been updated in-place via get_write_ptr() without
-     * going through kds_commit_page_hdr(); write it back out before the
-     * data write so what lands on disk matches frame->kp->hdr. Done via
-     * the same direct-pointer convention used elsewhere in this file. */
     {
         void *addr = kmap_local_page(frame->page);
         memcpy(addr, &frame->kp->hdr, KDS_PAGE_HDR_SIZE);
@@ -582,7 +563,7 @@ int kds_frame_flush(kds_frame_t *frame)
 
 void kds_buf_pool_get_stats(u32 *out_total, u32 *out_free, u32 *out_valid)
 {
-    u32 free_count = 0;
+    u32 free_count  = 0;
     u32 valid_count = 0;
     int i;
 
@@ -590,37 +571,19 @@ void kds_buf_pool_get_stats(u32 *out_total, u32 *out_free, u32 *out_valid)
         *out_total = KDS_BUF_NR_FRAMES;
 
     if (!g_pool) {
-        if (out_free)
-            *out_free = 0;
-        if (out_valid)
-            *out_valid = 0;
+        if (out_free)  *out_free  = 0;
+        if (out_valid) *out_valid = 0;
         return;
     }
 
-    /*
-     * Plain scan, no locking: this is a best-effort debug snapshot,
-     * not a value anything correctness-sensitive depends on. Each
-     * frame's state can change concurrently while this loop runs;
-     * the counts may be off by a frame or two under load, which is
-     * an acceptable tradeoff against taking 4096 individual
-     * frame_locks (or one global lock) just to report a number for
-     * a diagnostic command.
-     */
     for (i = 0; i < KDS_BUF_NR_FRAMES; i++) {
         switch (g_pool->frames[i].state) {
-        case KDS_FRAME_FREE:
-            free_count++;
-            break;
-        case KDS_FRAME_VALID:
-            valid_count++;
-            break;
-        default:
-            break;
+        case KDS_FRAME_FREE:  free_count++;  break;
+        case KDS_FRAME_VALID: valid_count++; break;
+        default: break;
         }
     }
 
-    if (out_free)
-        *out_free = free_count;
-    if (out_valid)
-        *out_valid = valid_count;
+    if (out_free)  *out_free  = free_count;
+    if (out_valid) *out_valid = valid_count;
 }

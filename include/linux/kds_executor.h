@@ -5,6 +5,7 @@
 #include <linux/kds_relation.h>
 #include <linux/kds_heap.h>
 #include <linux/ktime.h>
+#include <linux/kds_btree.h>
 
 /*
  * C port of the Python POC's executor.py state-pattern design
@@ -201,5 +202,55 @@ typedef struct kds_heap_insert_exec {
 
 void kds_heap_insert_exec_init(kds_heap_insert_exec_t *exec, kds_relation_t *rel,
                                 const void *data, u16 data_len, u64 xid);
+
+/* ------------------------------------------------------------------
+ * BtreeInsertExec
+ *
+ * Inserts one (key, value_page_id) pair into the btree rooted at
+ * rel->root_page_id.
+ *
+ * PHASES:
+ *
+ *   KDS_BTREE_INSERT_PHASE_SEARCH
+ *     Descends the tree one level per loop iteration (one page load
+ *     per step), recording the path in cursor. Resumable: the cursor
+ *     carries the full descent path including all pinned frames, so
+ *     a CONTINUE between two levels is safe -- the next call picks
+ *     up at cursor->depth + 1 without re-reading already-visited
+ *     nodes. Ends when a leaf is reached (cursor->nodes[depth].level
+ *     == 0) or -EEXIST (duplicate key).
+ *
+ *   KDS_BTREE_INSERT_PHASE_INSERT
+ *     Performs the actual leaf insert and any split propagation.
+ *     Treated as a single non-interruptible step: split propagation
+ *     touches O(tree_height) pages which is bounded and small, so
+ *     holding the slice across it is acceptable and simpler than
+ *     checkpointing mid-split.
+ *
+ *   KDS_BTREE_INSERT_PHASE_DONE
+ * ------------------------------------------------------------------ */
+
+typedef enum kds_btree_insert_phase {
+    KDS_BTREE_INSERT_PHASE_SEARCH = 0,
+    KDS_BTREE_INSERT_PHASE_INSERT,
+    KDS_BTREE_INSERT_PHASE_DONE,
+} kds_btree_insert_phase_t;
+
+typedef struct kds_btree_insert_exec {
+    kds_exec_state_t         base;
+
+    /* input */
+    kds_relation_t           *rel;
+    kds_tuple_id_t            key;
+    kds_page_id_t             value_page_id;
+
+    /* resume state */
+    kds_btree_insert_phase_t  phase;
+    kds_btree_cursor_t        cursor;        /* owns pinned frames during SEARCH */
+    kds_page_id_t             current_page_id; /* page being descended into next */
+} kds_btree_insert_exec_t;
+
+void kds_btree_insert_exec_init(kds_btree_insert_exec_t *exec, kds_relation_t *rel,
+                                 kds_tuple_id_t key, kds_page_id_t value_page_id);
 
 #endif /* __KDS_EXECUTOR_H */

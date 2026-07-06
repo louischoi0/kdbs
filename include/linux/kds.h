@@ -126,4 +126,11 @@ int write_sector_to_disk(sector_t sector, const char *data);
 int blkdev_read_sector(sector_t sector, char *buffer);
 int write_cache_flush(void);
 int __kds_write_page(kds_page_t* kd_page);
+
+static inline sector_t
+kds_page_sector(kds_page_id_t id)
+{
+    return (sector_t)id * (KDS_PAGE_SIZE / 512);
+}
+
 #endif

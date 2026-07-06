@@ -34,12 +34,6 @@ void kds_free_list_add(kds_page_t *kp)
   spin_unlock_irqrestore(&free_list_lock, flags);
 }
 
-static inline sector_t
-kds_page_sector(kds_page_id_t id)
-{
-    return (sector_t)( (id + DATA_PAGE_OFFSET) << 9);
-}
-
 /*
  * CRC and zero-fill below operate on KDS_PAGE_SIZE (the logical page
  * size), not the kernel's native PAGE_SIZE. The buffer itself is no
@@ -140,7 +134,7 @@ int kds_write_page(kds_frame_t *frame)
         return -ENODEV;
 
     sector = kds_page_sector(frame->kp->id);
-    pr_info("kds_write_page: sector=%llu\n", (unsigned long long)sector);
+    pr_info("kds_write_page: kpid=%d, sector=%llu\n", frame->kp->id,(unsigned long long)sector);
 
     return kds_write_logical_page(sector, frame->page);
 }

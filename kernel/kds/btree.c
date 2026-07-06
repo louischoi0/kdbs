@@ -177,8 +177,7 @@ int btree_cursor_search(kds_btree_cursor_t *cursor, kds_page_id_t root_page_id,
     return -E2BIG;  /* tree too deep */
 }
 
-static void btree_node_insert_at(kds_btree_node_t *node, int pos,
-                                  kds_tuple_id_t key, kds_page_id_t slot)
+void btree_node_insert_at(kds_btree_node_t *node, int pos, kds_tuple_id_t key, kds_page_id_t slot)
 {
     int i;
 
@@ -237,7 +236,7 @@ static kds_frame_t *btree_alloc_new_page(kds_page_type_t type)
     return frame;
 }
 
-static int btree_split_node(kds_btree_node_t *node, kds_btree_split_result_t *result)
+int btree_split_node(kds_btree_node_t *node, kds_btree_split_result_t *result)
 {
     kds_frame_t *new_frame;
     kds_btree_node_t new_node;
@@ -297,7 +296,7 @@ static int btree_split_node(kds_btree_node_t *node, kds_btree_split_result_t *re
     return 0;
 }
 
-static int btree_propagate_split(kds_btree_cursor_t *cursor,
+int btree_propagate_split(kds_btree_cursor_t *cursor,
                                   kds_btree_split_result_t *split_result)
 {
     int level;
@@ -375,44 +374,111 @@ static int btree_propagate_split(kds_btree_cursor_t *cursor,
     return 0;
 }
 
-int btree_insert(kds_page_id_t root_page_id, kds_tuple_id_t key,
-                 kds_page_id_t value_page_id)
+/*
+ * kds_btree_cursor_search(): public cursor-based descent.
+ * Descends from root_page_id to the correct leaf for `key`, filling
+ * *cursor with the path. Returns 0 (leaf found, no duplicate),
+ * -EEXIST (duplicate), or a negative errno. On any non-zero return
+ * the cursor has already been cleaned up.
+ *
+ * This is btree_cursor_search() renamed and made public so the
+ * executor layer can drive it one level at a time across scheduler
+ * slices without needing access to btree internals.
+ */
+int kds_btree_cursor_search(kds_btree_cursor_t *cursor,
+                             kds_page_id_t root_page_id,
+                             kds_tuple_id_t key)
 {
-    kds_btree_cursor_t      cursor;
-    kds_btree_node_t        *leaf;
-    int                     pos;
-    int                     ret;
+    kds_frame_t *frame;
+    kds_btree_node_t *node;
+    kds_page_id_t current_page_id = root_page_id;
+    int pos;
 
-    ret = btree_cursor_search(&cursor, root_page_id, key);
-    if (ret < 0) {
-        btree_cursor_cleanup(&cursor);
-        return ret;
+    btree_cursor_init(cursor);
+
+    while (cursor->depth < BTREE_MAX_DEPTH) {
+        frame = kds_buf_lookup_or_load(current_page_id);
+        if (IS_ERR(frame)) {
+            btree_cursor_cleanup(cursor);
+            return PTR_ERR(frame);
+        }
+
+        node = &cursor->nodes[cursor->depth];
+        load_btree_node(frame, node);
+
+        pos = btree_search_position(node, key);
+        cursor->positions[cursor->depth] = pos;
+
+        if (pos < node->key_count && node->keys[pos] == key) {
+            btree_cursor_cleanup(cursor);
+            return -EEXIST;
+        }
+
+        if (node->level == 0)
+            return 0; /* leaf reached -- cursor ready for insert */
+
+        current_page_id = node->slots[pos];
+        cursor->depth++;
     }
 
-    leaf = &cursor.nodes[cursor.depth];
-    pos = cursor.positions[cursor.depth];
+    btree_cursor_cleanup(cursor);
+    return -E2BIG;
+}
+
+/*
+ * kds_btree_cursor_insert(): public cursor-based insert.
+ * Performs the leaf insert and any required split propagation using
+ * the cursor already filled by kds_btree_cursor_search(). Releases
+ * all pinned cursor frames before returning, regardless of outcome.
+ * Returns 0 on success or a negative errno.
+ */
+int kds_btree_cursor_insert(kds_btree_cursor_t *cursor,
+                             kds_tuple_id_t key,
+                             kds_page_id_t value_page_id)
+{
+    kds_btree_node_t *leaf;
+    int pos;
+    int ret;
+
+    leaf = &cursor->nodes[cursor->depth];
+    pos  = cursor->positions[cursor->depth];
 
     if (leaf->key_count < BTREE_MAX_KEYS) {
         btree_node_insert_at(leaf, pos, key, value_page_id);
         store_btree_node(leaf);
-        btree_cursor_cleanup(&cursor);
+        btree_cursor_cleanup(cursor);
         return 0;
     }
 
-    kds_btree_split_result_t split_result;
+    {
+        kds_btree_split_result_t split_result;
 
-    btree_node_insert_at(leaf, pos, key, value_page_id);
+        btree_node_insert_at(leaf, pos, key, value_page_id);
 
-    ret = btree_split_node(leaf, &split_result);
-    if (ret < 0) {
-        btree_cursor_cleanup(&cursor);
-        return ret;
+        ret = btree_split_node(leaf, &split_result);
+        if (ret < 0) {
+            btree_cursor_cleanup(cursor);
+            return ret;
+        }
+
+        ret = btree_propagate_split(cursor, &split_result);
     }
 
-    ret = btree_propagate_split(&cursor, &split_result);
-
-    btree_cursor_cleanup(&cursor);
+    btree_cursor_cleanup(cursor);
     return ret;
+}
+
+int btree_insert(kds_page_id_t root_page_id, kds_tuple_id_t key,
+                 kds_page_id_t value_page_id)
+{
+    kds_btree_cursor_t cursor;
+    int ret;
+
+    ret = kds_btree_cursor_search(&cursor, root_page_id, key);
+    if (ret < 0)
+        return ret; /* -EEXIST, I/O error, or -E2BIG; cursor already cleaned up */
+
+    return kds_btree_cursor_insert(&cursor, key, value_page_id);
 }
 
 /*

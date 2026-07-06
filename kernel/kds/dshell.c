@@ -9,6 +9,7 @@
 #include <linux/kds_page_alloc.h>
 #include <linux/kds_meta.h>
 #include <linux/kds_proc.h>
+#include <linux/kds_parser.h>
 
 #include <linux/kernel.h>
 #include <linux/string.h>
@@ -84,7 +85,9 @@ typedef enum {
     KDS_DSHELL_EXEC_PENDING = 1,
 } kds_dshell_exec_state_t;
 
-#define KDS_DSHELL_EXEC_BUF_SIZE  sizeof(kds_heap_insert_exec_t)
+#define KDS_DSHELL_EXEC_BUF_SIZE  \
+    (sizeof(kds_heap_insert_exec_t) > sizeof(kds_btree_insert_exec_t) \
+     ? sizeof(kds_heap_insert_exec_t) : sizeof(kds_btree_insert_exec_t))
 
 typedef struct kds_dshell_client {
     /* response staging for read() */
@@ -128,239 +131,34 @@ static int kds_dshell_submit_insert_exec(kds_dshell_client_t *client,
  * ------------------------------------------------------------------ */
 
 /*
- * CRTB <table_name> [HEAP|BTREE] <col_name>:<type> [<col_name>:<type> ...]
- *
- * Defines a new table in the public namespace. The clustered storage
- * type is optional and defaults to HEAP for backward compatibility
- * with existing scripts that never specified one.
- *
- * <type> is any name registered in kds_types.h's type table
- * (int8/int16/int32/int64/float/decimal/bool/varchar/char) --
- * adding a new type there makes it usable here automatically, no
- * change needed in this file.
- *
- * Disambiguation: argv[2] is treated as the clustered-type keyword
- * only if it has no ':' in it (every column spec is required to be
- * "name:type", so a bare token here can't be a valid column spec).
- * This means a column literally named "HEAP" or "BTREE" without a
- * ':type' suffix would be misread as the keyword -- not a concern in
- * practice since every column spec must carry a type, but worth
- * keeping in mind if this parsing is reused elsewhere.
- *
- * Examples:
- *   CRTB users id:int64 name:varchar active:bool
- *   CRTB users BTREE id:int64 name:varchar active:bool
- *   CRTB users HEAP  id:int64 name:varchar active:bool
- */
-static int kds_cmd_create_table(char **argv, int argc, char *out, size_t out_size)
-{
-    const char  *table_name = argv[1];
-    kds_schema_t *schema;
-    kd_oid_t     new_oid;
-    kds_clustered_type_t clustered_type = KDS_CLUSTERED_HEAP;
-    int          col_start = 2;
-    int          i;
-    int          ret;
-
-    /*
-     * Optional clustered-type keyword right after the table name.
-     * argv[2] is the keyword candidate only when there are still
-     * column specs left after it (argc > 3) and it doesn't contain
-     * ':' -- a real column spec always does.
-     */
-    if (argc > 3 && !strchr(argv[2], ':')) {
-        if (!strcasecmp(argv[2], "HEAP")) {
-            clustered_type = KDS_CLUSTERED_HEAP;
-            col_start = 3;
-        } else if (!strcasecmp(argv[2], "BTREE")) {
-            clustered_type = KDS_CLUSTERED_BTREE;
-            col_start = 3;
-        } else {
-            scnprintf(out, out_size,
-                      "ERR unknown clustered type '%s' (expected HEAP or BTREE)\n",
-                      argv[2]);
-            return -EINVAL;
-        }
-    }
-
-    /*
-     * kds_schema_t embeds cols[KDS_SCHEMA_MAX_COLUMNS] (32 *
-     * sizeof(kds_sys_column_t), ~3KB) -- keeping that on the stack
-     * pushed this function's frame to 3040 bytes, well past the
-     * kernel's 2048-byte stack-frame warning threshold and a real
-     * stack-overflow risk on a call path that's already several
-     * frames deep (dshell write handler -> dispatch -> this ->
-     * catalog -> heap/btree -> page_mgr -> blkdev). Heap-allocating
-     * it keeps this frame small regardless of how big
-     * KDS_SCHEMA_MAX_COLUMNS grows in the future.
-     */
-    schema = kzalloc(sizeof(*schema), GFP_KERNEL);
-    if (!schema) {
-        scnprintf(out, out_size, "ERR out of memory\n");
-        return -ENOMEM;
-    }
-
-    for (i = col_start; i < argc; i++) {
-        char *spec = argv[i];
-        char *col_name;
-        char *type_name;
-        const kds_type_desc_t *type;
-        kds_sys_column_t *col;
-
-        if (schema->nr_cols >= KDS_SCHEMA_MAX_COLUMNS) {
-            scnprintf(out, out_size, "ERR too many columns (max %d)\n",
-                      KDS_SCHEMA_MAX_COLUMNS);
-            kfree(schema);
-            return -EINVAL;
-        }
-
-        col_name = strsep(&spec, ":");
-        type_name = spec;
-
-        if (!type_name || !*type_name) {
-            scnprintf(out, out_size, "ERR column '%s' missing :type\n", col_name);
-            kfree(schema);
-            return -EINVAL;
-        }
-
-        type = kds_type_lookup_by_name(type_name);
-        if (!type) {
-            scnprintf(out, out_size, "ERR unknown column type '%s'\n", type_name);
-            kfree(schema);
-            return -EINVAL;
-        }
-
-        col = &schema->cols[schema->nr_cols];
-        memset(col, 0, sizeof(*col));
-        col->pos = schema->nr_cols;
-        strncpy(col->name, col_name, KDS_CATALOG_NAME_MAX - 1);
-        col->name[KDS_CATALOG_NAME_MAX - 1] = '\0';
-        col->type_val = type->type_val;
-        col->len = type->fixed_len;
-        col->notnull = true;
-
-        schema->nr_cols++;
-    }
-
-    if (schema->nr_cols == 0) {
-        scnprintf(out, out_size, "ERR table must have at least one column\n");
-        kfree(schema);
-        return -EINVAL;
-    }
-
-    /*
-     * DB-wide constraint: the first column is always the table's
-     * primary key, and always int64. This is purely positional --
-     * there is no separate "is_pk" flag on kds_sys_column_t -- so
-     * enforcing it here, at the one place tables get defined, is
-     * what makes HeapPageInsertExec's duplicate-PK check (see
-     * kds_executor.h) able to assume "first 8 bytes = PK" for every
-     * heap table without any further bookkeeping. Applies equally
-     * to btree-clustered tables, since the leaf-level key is the
-     * same PK.
-     */
-    if (schema->cols[0].type_val != KDS_TYPE_INT64) {
-        scnprintf(out, out_size,
-                  "ERR first column ('%s') must be the primary key and type int64\n",
-                  schema->cols[0].name);
-        kfree(schema);
-        return -EINVAL;
-    }
-
-    ret = kds_catalog_create_table(KDS_OID_NAMESPACE_PUBLIC, table_name, schema,
-                                    clustered_type, &new_oid);
-    kfree(schema);
-
-    if (ret) {
-        scnprintf(out, out_size, "ERR create_table failed: %d\n", ret);
-        return ret;
-    }
-
-    scnprintf(out, out_size,
-              "OK table '%s' created, oid=%llu, columns=%u, clustered=%s\n",
-              table_name, (u64)new_oid, schema->nr_cols,
-              clustered_type == KDS_CLUSTERED_BTREE ? "BTREE" : "HEAP");
-    return 0;
-}
-
-/*
- * Row encoding used by INRW/SELC below -- there is no general
- * StructuredTuple-style codec on the C side yet (unlike the Python
- * POC), so this delegates per-column encode/decode entirely to
- * kds_types.h's registry: fixed-width types (int8/16/32/64/float/
- * decimal/bool) are stored back-to-back at their known fixed_len,
- * no length prefix needed; variable-width types (varchar/char) get
- * an explicit u16 length prefix ahead of their encoded bytes, same
- * as before.
- *
- * KNOWN LIMITATIONS (deliberate, to keep this a heap.c validation
- * tool rather than a real access method):
- *   - Only the table's single root heap page is touched
- *     (kds_relation_t.root_page_id) -- no multi-page table growth.
- *   - xmin is stamped with a fixed placeholder (KDS_DSHELL_XID)
- *     since there is no transaction manager yet to hand out real
- *     transaction ids.
+ * Placeholder transaction id used by all dshell commands until a
+ * real transaction manager exists.
  */
 #define KDS_DSHELL_XID      1
+
+/*
+ * Maximum encoded row size. Must be large enough to hold any row
+ * this dshell can INSERT or scan (mirrors KDS_EXEC_ROW_SCAN_BUF in
+ * executor.c -- the two aren't formally linked, so if one grows,
+ * check the other too).
+ */
 #define KDS_DSHELL_ROW_MAX  256
 
-
-
-static int kds_dshell_encode_row(const kds_schema_t *schema, char **argv,
-                                  u8 *buf, size_t buf_size, u16 *out_len)
-{
-    size_t off = 0;
-    u32 i;
-
-    for (i = 0; i < schema->nr_cols; i++) {
-        const kds_sys_column_t *col = &schema->cols[i];
-        const char *val = argv[2 + i];
-        const kds_type_desc_t *desc = kds_type_lookup_by_val((kds_type_val_t)col->type_val);
-        u16 written_len;
-        int ret;
-
-        if (!desc)
-            return -EINVAL;
-
-        if (desc->fixed_len == 0) {
-            /* Variable length: u16 length prefix, then the encoded
-             * payload right after it. */
-            if (off + sizeof(u16) > buf_size)
-                return -ENOSPC;
-
-            ret = desc->encode(val, buf + off + sizeof(u16),
-                                buf_size - off - sizeof(u16), &written_len);
-            if (ret)
-                return ret;
-
-            memcpy(buf + off, &written_len, sizeof(u16));
-            off += sizeof(u16) + written_len;
-        } else {
-            if (off + desc->fixed_len > buf_size)
-                return -ENOSPC;
-
-            ret = desc->encode(val, buf + off, buf_size - off, &written_len);
-            if (ret)
-                return ret;
-
-            off += written_len; /* == desc->fixed_len, by the type's own contract */
-        }
-    }
-
-    *out_len = (u16)off;
-    return 0;
-}
-
+/*
+ * Decodes a binary row into a human-readable "col=val, ..." string.
+ * Used by kds_cmd_scan_table() to format SELC output.
+ */
 static int kds_dshell_decode_row(const kds_schema_t *schema, const u8 *buf,
                                   u16 buf_len, char *out, size_t out_size)
 {
     size_t off = 0;
-    u32 i;
-    int n = 0;
+    u32    i;
+    int    n = 0;
 
     for (i = 0; i < schema->nr_cols; i++) {
-        const kds_sys_column_t *col = &schema->cols[i];
-        const kds_type_desc_t *desc = kds_type_lookup_by_val((kds_type_val_t)col->type_val);
+        const kds_sys_column_t *col  = &schema->cols[i];
+        const kds_type_desc_t  *desc =
+            kds_type_lookup_by_val((kds_type_val_t)col->type_val);
         u16 value_len;
         int decoded;
 
@@ -396,37 +194,173 @@ static int kds_dshell_decode_row(const kds_schema_t *schema, const u8 *buf,
 }
 
 /*
- * INRW <table_name> <val1> <val2> ... (one value per schema column,
- * in column order)
- *
- * Drives a kds_heap_insert_exec_t via the proc scheduler:
- *   1. Parse + validate inputs synchronously in write() context.
- *   2. Initialise the exec into client->exec_buf.
- *   3. Hand off to kds_dshell_submit_insert_exec(), which marks the
- *      client EXEC_PENDING and blocks until kds_dshell_proc_run()
- *      finishes the work slice-by-slice.
- *   4. On return, format the response into `out`.
- *
- * row_buf is stack-allocated here; the exec's data pointer points
- * into it, which is safe because this function doesn't return until
- * kds_dshell_submit_insert_exec() comes back (i.e. the exec is fully
- * complete before the stack frame is torn down).
+ * Handler for KDS_STMT_CREATE_TABLE.
+ * All parsing (table name, clustered type, column names and types) has
+ * already been done by kds_parse(); this function only drives the
+ * catalog layer and formats the response.
  */
-static int kds_cmd_insert_row(kds_dshell_client_t *client,
-                               char **argv, int argc,
+static int kds_cmd_create_table(const kds_stmt_create_table_t *stmt,
+                                 char *out, size_t out_size)
+{
+    kds_schema_t *schema;
+    kd_oid_t      new_oid;
+    u32           i;
+    int           ret;
+
+    schema = kzalloc(sizeof(*schema), GFP_KERNEL);
+    if (!schema) {
+        scnprintf(out, out_size, "ERR out of memory\n");
+        return -ENOMEM;
+    }
+
+    for (i = 0; i < stmt->nr_cols; i++) {
+        const kds_ast_col_def_t *src = &stmt->cols[i];
+        kds_sys_column_t        *col = &schema->cols[i];
+
+        col->pos      = i;
+        col->type_val = src->type_val;
+        col->len      = src->len;
+        col->notnull  = true;
+        strncpy(col->name, src->name, KDS_CATALOG_NAME_MAX - 1);
+        col->name[KDS_CATALOG_NAME_MAX - 1] = '\0';
+    }
+    schema->nr_cols = stmt->nr_cols;
+
+    /*
+     * DB-wide constraint: the first column must be the primary key
+     * and must be int64. The parser does not enforce this because it
+     * has no knowledge of DB semantics -- enforce it here, at the
+     * boundary between parsing and catalog access.
+     */
+    if (schema->cols[0].type_val != KDS_TYPE_INT64) {
+        scnprintf(out, out_size,
+                  "ERR first column ('%s') must be the primary key and type int64\n",
+                  schema->cols[0].name);
+        kfree(schema);
+        return -EINVAL;
+    }
+
+    ret = kds_catalog_create_table(KDS_OID_NAMESPACE_PUBLIC,
+                                    stmt->table_name, schema,
+                                    stmt->clustered, &new_oid);
+    kfree(schema);
+
+    if (ret) {
+        scnprintf(out, out_size, "ERR create_table failed: %d\n", ret);
+        return ret;
+    }
+
+    scnprintf(out, out_size,
+              "OK table '%s' created, oid=%llu, columns=%u, clustered=%s\n",
+              stmt->table_name, (u64)new_oid, stmt->nr_cols,
+              stmt->clustered == KDS_CLUSTERED_BTREE ? "BTREE" : "HEAP");
+    return 0;
+}
+
+/*
+ * Row encoding -- converts kds_ast_val_t[] (parser output) into the
+ * on-disk binary row format. Fixed-width types are stored back-to-back
+ * at their known fixed_len; variable-width types get a u16 length
+ * prefix ahead of their encoded bytes.
+ */
+static int kds_dshell_encode_row_from_vals(const kds_schema_t   *schema,
+                                            const kds_ast_val_t  *vals,
+                                            u32                   nr_vals,
+                                            u8 *buf, size_t buf_size,
+                                            u16 *out_len)
+{
+    size_t off = 0;
+    u32    i;
+
+    for (i = 0; i < schema->nr_cols; i++) {
+        const kds_sys_column_t *col  = &schema->cols[i];
+        const kds_ast_val_t    *val  = &vals[i];
+        const kds_type_desc_t  *desc =
+            kds_type_lookup_by_val((kds_type_val_t)col->type_val);
+        u16 written_len;
+        int ret;
+
+        if (!desc)
+            return -EINVAL;
+
+        /*
+         * Convert the AST value to a string representation that the
+         * type descriptor's encode() function can consume. encode()
+         * always takes a NUL-terminated string input -- this is the
+         * same convention kds_dshell_encode_row() used via argv[].
+         */
+        {
+            char val_str[KDS_PARSER_VAL_MAX];
+
+            switch (val->type) {
+            case KDS_VAL_INT:
+                scnprintf(val_str, sizeof(val_str), "%lld", (long long)val->int_val);
+                break;
+            case KDS_VAL_STR:
+                strncpy(val_str, val->str_val, sizeof(val_str) - 1);
+                val_str[sizeof(val_str) - 1] = '\0';
+                break;
+            case KDS_VAL_NULL:
+                val_str[0] = '\0';
+                break;
+            default:
+                return -EINVAL;
+            }
+
+            if (desc->fixed_len == 0) {
+                if (off + sizeof(u16) > buf_size)
+                    return -ENOSPC;
+                ret = desc->encode(val_str, buf + off + sizeof(u16),
+                                   buf_size - off - sizeof(u16), &written_len);
+                if (ret)
+                    return ret;
+                memcpy(buf + off, &written_len, sizeof(u16));
+                off += sizeof(u16) + written_len;
+            } else {
+                if (off + desc->fixed_len > buf_size)
+                    return -ENOSPC;
+                ret = desc->encode(val_str, buf + off,
+                                   buf_size - off, &written_len);
+                if (ret)
+                    return ret;
+                off += written_len;
+            }
+        }
+    }
+
+    *out_len = (u16)off;
+    return 0;
+}
+
+/*
+ * Handler for KDS_STMT_INSERT.
+ *
+ * rel->kind를 조회해서 HEAP이면 kds_heap_insert_exec_t,
+ * BTREE이면 kds_btree_insert_exec_t를 사용한다.
+ *
+ * HEAP: 행 전체를 인코딩해서 heap 페이지에 저장하고
+ *       out_tid(page_id + slot)를 응답에 출력한다.
+ *
+ * BTREE: PK(첫 번째 컬럼, int64)를 key로, 인코딩된 행 전체를
+ *        저장할 별도 heap 페이지 id를 value로 삼는다.
+ *        현재는 행 데이터를 heap 페이지에 먼저 삽입한 뒤
+ *        그 tid.page_id를 btree의 value_page_id로 넣는다.
+ *        (heap insert → btree index insert 순서)
+ */
+static int kds_cmd_insert_row(kds_dshell_client_t        *client,
+                               const kds_stmt_insert_t    *stmt,
                                char *out, size_t out_size)
 {
-    const char *table_name = argv[1];
-    kd_oid_t oid;
+    kd_oid_t        oid;
     kds_relation_t *rel;
-    u8 row_buf[KDS_DSHELL_ROW_MAX];
-    u16 row_len;
-    kds_heap_insert_exec_t exec;
-    int ret;
+    u8              row_buf[KDS_DSHELL_ROW_MAX];
+    u16             row_len;
+    int             ret;
 
-    ret = kds_catalog_find_table_oid_by_name(table_name, &oid);
+    ret = kds_catalog_find_table_oid_by_name(stmt->table_name, &oid);
     if (ret) {
-        scnprintf(out, out_size, "ERR table '%s' not found: %d\n", table_name, ret);
+        scnprintf(out, out_size, "ERR table '%s' not found: %d\n",
+                  stmt->table_name, ret);
         return ret;
     }
 
@@ -437,72 +371,123 @@ static int kds_cmd_insert_row(kds_dshell_client_t *client,
         return ret;
     }
 
-    if (rel->kind != KDS_CLUSTERED_HEAP && rel->kind != KDS_CLUSTERED_BTREE) {
+    if (stmt->nr_values != rel->schema.nr_cols) {
         scnprintf(out, out_size,
-                  "ERR '%s' is not heap-clustered or btree-clustered\n", table_name);
+                  "ERR '%s' has %u column(s), got %u value(s)\n",
+                  stmt->table_name, rel->schema.nr_cols, stmt->nr_values);
         kds_relation_close(rel);
         return -EINVAL;
     }
 
-    if ((u32)(argc - 2) != rel->schema.nr_cols) {
-        scnprintf(out, out_size, "ERR '%s' has %u column(s), got %d value(s)\n",
-                  table_name, rel->schema.nr_cols, argc - 2);
-        kds_relation_close(rel);
-        return -EINVAL;
-    }
-
-    ret = kds_dshell_encode_row(&rel->schema, argv, row_buf, sizeof(row_buf), &row_len);
+    ret = kds_dshell_encode_row_from_vals(&rel->schema,
+                                           stmt->values, stmt->nr_values,
+                                           row_buf, sizeof(row_buf), &row_len);
     if (ret) {
-        scnprintf(out, out_size, "ERR failed to encode row (too long or bad value)\n");
+        scnprintf(out, out_size,
+                  "ERR failed to encode row (too long or bad value): %d\n", ret);
         kds_relation_close(rel);
         return ret;
     }
 
-    kds_heap_insert_exec_init(&exec, rel, row_buf, row_len, KDS_DSHELL_XID);
+    if (rel->kind == KDS_CLUSTERED_HEAP) {
+        /* --------------------------------------------------------
+         * HEAP insert: 행 전체를 heap 페이지에 직접 삽입.
+         * -------------------------------------------------------- */
+        kds_heap_insert_exec_t exec;
 
-    /*
-     * Submit exec to kds_dshell_proc_run() and block until done.
-     * The proc slices the work with the scheduler's own slice_ns
-     * budget, so INRW on a large table no longer monopolises the CPU.
-     * resp_buf is written here (not in proc_run) for the success path:
-     * kds_dshell_submit_insert_exec() returns only after the exec has
-     * reached DONE or ERROR, so exec.out_tid is valid by the time we
-     * read it below.
-     */
-    ret = kds_dshell_submit_insert_exec(client, &exec);
-    if (ret == -ETIMEDOUT) {
-        /* resp_buf already filled by the timeout handler */
+        kds_heap_insert_exec_init(&exec, rel, row_buf, row_len,
+                                   KDS_DSHELL_XID);
+
+        ret = kds_dshell_submit_insert_exec(client, &exec);
         kds_relation_close(rel);
-        return ret;
-    }
 
-    kds_relation_close(rel);
+        if (ret == -ETIMEDOUT)
+            return ret;
 
-    /*
-     * exec_buf holds the completed kds_heap_insert_exec_t; cast back
-     * to read out_tid and base.ret (proc_run wrote ERR response for
-     * ERROR, so we only need to handle DONE here).
-     */
-    {
-        kds_heap_insert_exec_t *done_exec =
-            (kds_heap_insert_exec_t *)client->exec_buf;
+        {
+            kds_heap_insert_exec_t *done =
+                (kds_heap_insert_exec_t *)client->exec_buf;
 
-        if (done_exec->base.ret != 0) {
-            if (done_exec->base.ret == -EEXIST) {
-                scnprintf(out, out_size,
-                          "ERR duplicate primary key in '%s'\n", table_name);
-            } else {
-                scnprintf(out, out_size,
-                          "ERR insert failed: %d\n", done_exec->base.ret);
+            if (done->base.ret != 0) {
+                if (done->base.ret == -EEXIST)
+                    scnprintf(out, out_size,
+                              "ERR duplicate primary key in '%s'\n",
+                              stmt->table_name);
+                else
+                    scnprintf(out, out_size,
+                              "ERR insert failed: %d\n", done->base.ret);
+                return done->base.ret;
             }
-            return done_exec->base.ret;
+
+            scnprintf(out, out_size,
+                      "OK inserted into '%s' at page=%llu slot=%u\n",
+                      stmt->table_name,
+                      (u64)done->out_tid.page_id,
+                      done->out_tid.slot);
         }
 
+    } else if (rel->kind == KDS_CLUSTERED_BTREE) {
+        /* --------------------------------------------------------
+         * BTREE insert: PK를 key로, root_page_id의 btree에 삽입.
+         *
+         * PK는 첫 번째 컬럼이 항상 int64라는 DB-wide 불변식을
+         * 이용해서 row_buf 첫 8바이트에서 직접 읽는다.
+         * -------------------------------------------------------- */
+        kds_btree_insert_exec_t exec;
+        kds_tuple_id_t          pk;
+
+        if (row_len < sizeof(pk)) {
+            scnprintf(out, out_size, "ERR row too short to contain PK\n");
+            kds_relation_close(rel);
+            return -EINVAL;
+        }
+        memcpy(&pk, row_buf, sizeof(pk));
+
+        /*
+         * value_page_id: btree leaf가 가리킬 "데이터 페이지".
+         * 현재는 root_page_id 자체를 데이터 저장소로 쓰는 단순
+         * 구현이므로 0을 넣어서 "인라인 데이터 없음"으로 처리.
+         * 추후 heap 페이지를 별도로 두는 클러스터드 btree로
+         * 전환 시 heap insert → btree insert 순서로 변경할 것.
+         */
+        kds_btree_insert_exec_init(&exec, rel, pk, 0);
+
+        BUILD_BUG_ON(sizeof(exec) > KDS_DSHELL_EXEC_BUF_SIZE);
+        memcpy(client->exec_buf, &exec, sizeof(exec));
+
+        ret = kds_dshell_run_exec_via_proc(client);
+        kds_relation_close(rel);
+
+        if (ret == -ETIMEDOUT)
+            return ret;
+
+        {
+            kds_btree_insert_exec_t *done =
+                (kds_btree_insert_exec_t *)client->exec_buf;
+
+            if (done->base.ret != 0) {
+                if (done->base.ret == -EEXIST)
+                    scnprintf(out, out_size,
+                              "ERR duplicate key %lld in '%s'\n",
+                              (long long)pk, stmt->table_name);
+                else
+                    scnprintf(out, out_size,
+                              "ERR btree insert failed: %d\n",
+                              done->base.ret);
+                return done->base.ret;
+            }
+
+            scnprintf(out, out_size,
+                      "OK inserted into '%s' (btree) key=%lld\n",
+                      stmt->table_name, (long long)pk);
+        }
+
+    } else {
         scnprintf(out, out_size,
-                  "OK inserted into '%s' at page=%llu slot=%u\n",
-                  table_name,
-                  (u64)done_exec->out_tid.page_id,
-                  done_exec->out_tid.slot);
+                  "ERR '%s' has unsupported clustered type %d\n",
+                  stmt->table_name, rel->kind);
+        kds_relation_close(rel);
+        return -EINVAL;
     }
 
     return 0;
@@ -520,9 +505,10 @@ static int kds_cmd_insert_row(kds_dshell_client_t *client,
  * no index of any kind -- there's no way to jump directly to a
  * particular page, only to walk the whole chain start to finish.
  */
-static int kds_cmd_scan_table(char **argv, int argc, char *out, size_t out_size)
+static int kds_cmd_scan_table(const kds_stmt_select_t *stmt,
+                               char *out, size_t out_size)
 {
-    const char *table_name = argv[1];
+    const char *table_name = stmt->table_name;
     kd_oid_t oid;
     kds_relation_t *rel;
     kds_page_id_t current_page_id;
@@ -618,7 +604,7 @@ static int kds_cmd_scan_table(char **argv, int argc, char *out, size_t out_size)
  * kds_superblock_fsync(), which this command does NOT call -- it
  * only reads the in-memory copy, not a fresh read from disk).
  */
-static int kds_cmd_show_meta(char **argv, int argc, char *out, size_t out_size)
+static int kds_cmd_show_meta(char *out, size_t out_size)
 {
     kds_superblock_t *sb = ref_superblock();
     unsigned long flags;
@@ -667,7 +653,7 @@ static int kds_cmd_show_meta(char **argv, int argc, char *out, size_t out_size)
  * occupancy (kds_page_mgr.c). Useful for debugging exactly the class
  * of issue seen earlier (ring staged at 0, or never refilling).
  */
-static int kds_cmd_show_page_alloc_status(char **argv, int argc, char *out, size_t out_size)
+static int kds_cmd_show_page_alloc_status(char *out, size_t out_size)
 {
     kds_page_id_t alloc_point;
     u64 alloc_remaining, ring_count, freelist_count;
@@ -688,112 +674,37 @@ static int kds_cmd_show_page_alloc_status(char **argv, int argc, char *out, size
 }
 
 /* ------------------------------------------------------------------
- * Command table -- see kds_dshell.h for how to add a new command.
+ * Statement dispatcher
+ *
+ * Receives a fully-parsed kds_stmt_t and routes it to the appropriate
+ * handler. No string parsing happens here -- all token/keyword work
+ * was done by kds_parse() before this is called.
  * ------------------------------------------------------------------ */
 
-static const kds_dshell_cmd_t kds_dshell_cmds[] = {
-    { "CRTB", kds_cmd_create_table,           3 },
-    { "SELC", kds_cmd_scan_table,             2 },
-    { "META", kds_cmd_show_meta,              1 },
-    { "PSTA", kds_cmd_show_page_alloc_status, 1 },
-};
-
-#define KDS_DSHELL_CMD_COUNT \
-    (sizeof(kds_dshell_cmds) / sizeof(kds_dshell_cmds[0]))
-
-/*
- * Dispatches one already-tokenized command line. Always produces a
- * response in `out` -- either the handler's own output, or a
- * generic "unknown command"/"too few arguments" message if dispatch
- * itself couldn't even reach a handler.
- */
-/*
- * The dispatch table fn signature does not carry a client pointer
- * because most handlers (META, PSTA, CRTB, SELC) don't need it.
- * Only INRW needs to submit an exec to the proc, and it gets the
- * client pointer via the dedicated kds_dshell_exec_cmd_t entry type
- * below. To keep the common path simple, handlers that need a client
- * are registered in kds_dshell_exec_cmds[] (separate table) and
- * checked first in dispatch.
- */
-typedef int (*kds_dshell_exec_fn)(kds_dshell_client_t *client,
-                                   char **argv, int argc,
-                                   char *out, size_t out_size);
-
-typedef struct {
-    const char          *op;
-    kds_dshell_exec_fn   fn;
-    int                  min_args;
-} kds_dshell_exec_cmd_t;
-
-static const kds_dshell_exec_cmd_t kds_dshell_exec_cmds[] = {
-    { "INRW", kds_cmd_insert_row, 3 },
-};
-
-#define KDS_DSHELL_EXEC_CMD_COUNT \
-    (sizeof(kds_dshell_exec_cmds) / sizeof(kds_dshell_exec_cmds[0]))
-
-static int __kds_dispatch_dshell_cmd(kds_dshell_client_t *client,
-                                      char **argv, int argc,
-                                      char *out, size_t out_size)
+static int kds_dispatch_stmt(kds_dshell_client_t *client,
+                              const kds_stmt_t    *stmt,
+                              char *out, size_t out_size)
 {
-    u32 i;
+    switch (stmt->type) {
+    case KDS_STMT_CREATE_TABLE:
+        return kds_cmd_create_table(&stmt->create_table, out, out_size);
 
-    if (argc < 1) {
-        scnprintf(out, out_size, "ERR empty command\n");
+    case KDS_STMT_INSERT:
+        return kds_cmd_insert_row(client, &stmt->insert, out, out_size);
+
+    case KDS_STMT_SELECT:
+        return kds_cmd_scan_table(&stmt->select, out, out_size);
+
+    case KDS_STMT_SHOW_META:
+        return kds_cmd_show_meta(out, out_size);
+
+    case KDS_STMT_SHOW_ALLOC:
+        return kds_cmd_show_page_alloc_status(out, out_size);
+
+    default:
+        scnprintf(out, out_size, "ERR unknown statement type %d\n", stmt->type);
         return -EINVAL;
     }
-
-    /* Check exec-capable commands first (need client pointer). */
-    for (i = 0; i < KDS_DSHELL_EXEC_CMD_COUNT; i++) {
-        if (strcmp(argv[0], kds_dshell_exec_cmds[i].op))
-            continue;
-
-        if (argc < kds_dshell_exec_cmds[i].min_args) {
-            scnprintf(out, out_size, "ERR %s requires at least %d arg(s), got %d\n",
-                      argv[0], kds_dshell_exec_cmds[i].min_args, argc);
-            return -EINVAL;
-        }
-
-        return kds_dshell_exec_cmds[i].fn(client, argv, argc, out, out_size);
-    }
-
-    /* Then lightweight commands (no client pointer needed). */
-    for (i = 0; i < KDS_DSHELL_CMD_COUNT; i++) {
-        if (strcmp(argv[0], kds_dshell_cmds[i].op))
-            continue;
-
-        if (argc < kds_dshell_cmds[i].min_args) {
-            scnprintf(out, out_size, "ERR %s requires at least %d arg(s), got %d\n",
-                      argv[0], kds_dshell_cmds[i].min_args, argc);
-            return -EINVAL;
-        }
-
-        return kds_dshell_cmds[i].fn(argv, argc, out, out_size);
-    }
-
-    scnprintf(out, out_size, "ERR unknown command: %s\n", argv[0]);
-    return -ENOENT;
-}
-
-int kds_split_cmd(char *buf, char *argv[], int max_args)
-{
-    int argc = 0;
-    char *token;
-
-    if (!buf || !argv || max_args <= 0)
-        return -EINVAL;
-
-    while ((token = strsep(&buf, " \t\n")) != NULL) {
-        if (*token == '\0')
-            continue;
-
-        argv[argc++] = token;
-        if (argc >= max_args)
-            break;
-    }
-
-    return argc;
 }
 
 /* ------------------------------------------------------------------
@@ -1000,31 +911,32 @@ static ssize_t kds_dshell_write(struct file *filp, const char __user *ubuf,
                                  size_t len, loff_t *off)
 {
     kds_dshell_client_t *client = filp->private_data;
-    char cmd_buf[DSHELL_LINE_MAX];
-    char *argv[DSHELL_MAX_ARGS];
-    size_t n;
-    int argc;
+    char                 sql_buf[DSHELL_LINE_MAX];
+    kds_stmt_t           stmt;
+    char                 parse_err[KDS_PARSER_ERR_MAX];
+    size_t               n;
+    int                  ret;
 
     if (!client)
         return -EINVAL;
 
-    n = min(len, sizeof(cmd_buf) - 1);
-    if (copy_from_user(cmd_buf, ubuf, n))
+    n = min(len, sizeof(sql_buf) - 1);
+    if (copy_from_user(sql_buf, ubuf, n))
         return -EFAULT;
-    cmd_buf[n] = '\0';
+    sql_buf[n] = '\0';
 
     /* Reset response staging for this new command. */
     client->resp_buf[0] = '\0';
-    client->resp_len = 0;
-    client->resp_pos = 0;
+    client->resp_len    = 0;
+    client->resp_pos    = 0;
 
-    argc = kds_split_cmd(cmd_buf, argv, DSHELL_MAX_ARGS);
-    if (argc < 0) {
+    ret = kds_parse(sql_buf, &stmt, parse_err, sizeof(parse_err));
+    if (ret) {
         scnprintf(client->resp_buf, sizeof(client->resp_buf),
-                  "ERR failed to parse command\n");
+                  "ERR parse error: %s\n", parse_err);
     } else {
-        __kds_dispatch_dshell_cmd(client, argv, argc,
-                                   client->resp_buf, sizeof(client->resp_buf));
+        kds_dispatch_stmt(client, &stmt,
+                          client->resp_buf, sizeof(client->resp_buf));
     }
 
     client->resp_len = strnlen(client->resp_buf, sizeof(client->resp_buf));

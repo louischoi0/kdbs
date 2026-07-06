@@ -337,16 +337,30 @@ void kds_heap_insert_exec_init(kds_heap_insert_exec_t *exec, kds_relation_t *rel
  * ------------------------------------------------------------------ */
 
 /*
- * PHASE_SEARCH: descends the btree one level per iteration, checking
- * the slice deadline after each level. Resumable: exec->current_page_id
- * and exec->cursor are checkpointed on CONTINUE.
+ * PHASE_SEARCH: descends the btree one level per iteration, storing
+ * each visited node into exec->cursor. Resumable across slices:
+ * exec->current_page_id is the next page to load, and exec->cursor
+ * already holds all frames pinned so far.
+ *
+ * Unlike btree_cursor_search() (which does the whole descent in one
+ * call), this drives the descent manually so it can yield between
+ * levels. The search position logic mirrors btree_search_position()
+ * in btree.c exactly.
+ *
+ * Returns:
+ *   KDS_EXEC_DONE     → reached a leaf; exec->cursor is ready for
+ *                        PHASE_INSERT to use directly.
+ *   KDS_EXEC_ERROR    → duplicate key (base->ret = -EEXIST) or I/O
+ *                        error; exec->cursor is cleaned up here.
+ *   KDS_EXEC_CONTINUE → slice spent mid-descent; exec->cursor and
+ *                        exec->current_page_id are checkpointed.
  */
 static kds_exec_result_t kds_btree_insert_run_search(kds_btree_insert_exec_t *exec)
 {
     while (exec->cursor.depth < BTREE_MAX_DEPTH) {
         kds_frame_t *frame;
         kds_btree_node_t *node;
-        int pos, i;
+        int pos;
 
         frame = kds_buf_lookup_or_load(exec->current_page_id);
         if (IS_ERR(frame)) {
@@ -358,15 +372,24 @@ static kds_exec_result_t kds_btree_insert_run_search(kds_btree_insert_exec_t *ex
         node = &exec->cursor.nodes[exec->cursor.depth];
         load_btree_node(frame, node);
 
-        pos = node->key_count;
-        for (i = 0; i < node->key_count; i++) {
-            if (exec->key <= node->keys[i]) {
-                pos = i;
-                break;
+        /* btree_search_position(): find insertion slot for exec->key */
+        pos = 0;
+        {
+            int i;
+
+            for (i = 0; i < node->key_count; i++) {
+                if (exec->key <= node->keys[i]) {
+                    pos = i;
+                    goto pos_found;
+                }
             }
+            pos = node->key_count;
+pos_found:;
         }
+
         exec->cursor.positions[exec->cursor.depth] = pos;
 
+        /* Duplicate key check */
         if (pos < node->key_count && node->keys[pos] == exec->key) {
             exec->base.ret = -EEXIST;
             btree_cursor_cleanup(&exec->cursor);
@@ -375,9 +398,11 @@ static kds_exec_result_t kds_btree_insert_run_search(kds_btree_insert_exec_t *ex
 
         exec->base.units_done++;
 
+        /* Leaf reached -- descent complete */
         if (node->level == 0)
             return KDS_EXEC_DONE;
 
+        /* Descend one level */
         exec->current_page_id = node->slots[pos];
         exec->cursor.depth++;
 
@@ -385,25 +410,57 @@ static kds_exec_result_t kds_btree_insert_run_search(kds_btree_insert_exec_t *ex
             return KDS_EXEC_CONTINUE;
     }
 
+    /* Tree deeper than BTREE_MAX_DEPTH -- shouldn't happen */
     exec->base.ret = -E2BIG;
     btree_cursor_cleanup(&exec->cursor);
     return KDS_EXEC_ERROR;
 }
 
 /*
- * PHASE_INSERT: leaf insert + split propagation via the public
- * kds_btree_cursor_insert() API. Non-interruptible: split propagation
- * is O(tree_height) in-memory work, bounded and fast.
- * kds_btree_cursor_insert() owns and releases the cursor's pinned frames.
+ * PHASE_INSERT: performs the leaf insert and any required split
+ * propagation. Mirrors btree_insert() in btree.c exactly, but
+ * operates on the already-computed exec->cursor from PHASE_SEARCH
+ * instead of calling btree_cursor_search() again.
+ *
+ * Treated as a single non-interruptible step: split propagation
+ * touches O(tree_height) pages which is bounded (BTREE_MAX_DEPTH)
+ * and fast relative to the page-load cost already paid in
+ * PHASE_SEARCH -- no mid-split checkpoint needed.
  */
 static kds_exec_result_t kds_btree_insert_run_insert(kds_btree_insert_exec_t *exec)
 {
-    int ret = kds_btree_cursor_insert(&exec->cursor,
-                                       exec->key,
-                                       exec->value_page_id);
-    if (ret < 0) {
-        exec->base.ret = ret;
-        return KDS_EXEC_ERROR;
+    kds_btree_node_t *leaf;
+    int pos;
+    int ret;
+
+    leaf = &exec->cursor.nodes[exec->cursor.depth];
+    pos  = exec->cursor.positions[exec->cursor.depth];
+
+    if (leaf->key_count < BTREE_MAX_KEYS) {
+        /* Fast path: leaf has room */
+        btree_node_insert_at(leaf, pos, exec->key, exec->value_page_id);
+        store_btree_node(leaf);
+        exec->base.units_done++;
+        return KDS_EXEC_DONE;
+    }
+
+    /* Leaf is full: insert then split */
+    {
+        kds_btree_split_result_t split_result;
+
+        btree_node_insert_at(leaf, pos, exec->key, exec->value_page_id);
+
+        ret = btree_split_node(leaf, &split_result);
+        if (ret < 0) {
+            exec->base.ret = ret;
+            return KDS_EXEC_ERROR;
+        }
+
+        ret = btree_propagate_split(&exec->cursor, &split_result);
+        if (ret < 0) {
+            exec->base.ret = ret;
+            return KDS_EXEC_ERROR;
+        }
     }
 
     exec->base.units_done++;
