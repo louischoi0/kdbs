@@ -4,8 +4,8 @@
 #include <linux/kds.h>
 #include <linux/kds_relation.h>
 #include <linux/kds_heap.h>
-#include <linux/ktime.h>
 #include <linux/kds_btree.h>
+#include <linux/ktime.h>
 
 /*
  * C port of the Python POC's executor.py state-pattern design
@@ -172,6 +172,20 @@ static inline bool kds_exec_slice_expired(kds_exec_state_t *state)
 typedef enum kds_heap_insert_phase {
     KDS_HEAP_INSERT_PHASE_DUP_SCAN = 0,
     KDS_HEAP_INSERT_PHASE_FIND_TAIL,
+    /*
+     * WAL_INSERT: append KDS_WAL_REC_INSERT record to the WAL ring
+     * buffer before the data page is modified. The page_id and slot
+     * are known at this point (FIND_TAIL has located the target page);
+     * the WAL record is written first so crash recovery can re-apply
+     * the modification if the data page flush is interrupted.
+     */
+    KDS_HEAP_INSERT_PHASE_WAL_INSERT,
+    /*
+     * WAL_INIT_PAGE: append KDS_WAL_REC_INIT_PAGE before a newly
+     * allocated heap page is first written to. Only entered when
+     * FIND_TAIL needed to grow the chain.
+     */
+    KDS_HEAP_INSERT_PHASE_WAL_INIT_PAGE,
     KDS_HEAP_INSERT_PHASE_DONE,
 } kds_heap_insert_phase_t;
 
@@ -198,6 +212,14 @@ typedef struct kds_heap_insert_exec {
     kds_heap_insert_phase_t  phase;
     kds_page_id_t            cursor_page_id; /* next page to visit in the current phase */
     s64                      new_pk;          /* decoded once, reused by both phases */
+
+    /*
+     * WAL state: set by FIND_TAIL before transitioning to
+     * WAL_INSERT / WAL_INIT_PAGE, consumed by those phases.
+     */
+    kds_page_id_t            wal_target_page_id;  /* page about to be modified    */
+    u32                      wal_target_offset;   /* byte offset of new slot      */
+    bool                     wal_need_init_page;  /* page was newly allocated     */
 } kds_heap_insert_exec_t;
 
 void kds_heap_insert_exec_init(kds_heap_insert_exec_t *exec, kds_relation_t *rel,
@@ -206,33 +228,48 @@ void kds_heap_insert_exec_init(kds_heap_insert_exec_t *exec, kds_relation_t *rel
 /* ------------------------------------------------------------------
  * BtreeInsertExec
  *
- * Inserts one (key, value_page_id) pair into the btree rooted at
- * rel->root_page_id.
+ * Inserts one row into a btree-clustered table.
  *
- * PHASES:
+ * PHASES (strictly WAL-before-data order):
  *
- *   KDS_BTREE_INSERT_PHASE_SEARCH
- *     Descends the tree one level per loop iteration (one page load
- *     per step), recording the path in cursor. Resumable: the cursor
- *     carries the full descent path including all pinned frames, so
- *     a CONTINUE between two levels is safe -- the next call picks
- *     up at cursor->depth + 1 without re-reading already-visited
- *     nodes. Ends when a leaf is reached (cursor->nodes[depth].level
- *     == 0) or -EEXIST (duplicate key).
+ *   SEARCH_AND_PREPARE
+ *     Single btree descent that simultaneously:
+ *       - finds the leaf slot (min_key <= key) and its heap page
+ *       - loads the heap page to check for duplicate PK
+ *       - checks whether the heap page has space (need_new_page)
+ *     Resumable per btree level. Cursor holds pinned frames for
+ *     later reuse in BTREE_INSERT.
+ *     No page modification.
  *
- *   KDS_BTREE_INSERT_PHASE_INSERT
- *     Performs the actual leaf insert and any split propagation.
- *     Treated as a single non-interruptible step: split propagation
- *     touches O(tree_height) pages which is bounded and small, so
- *     holding the slice across it is acceptable and simpler than
- *     checkpointing mid-split.
+ *   WAL_INIT_PAGE   [need_new_page only]
+ *     WAL ring buffer ← KDS_WAL_REC_INIT_PAGE
  *
- *   KDS_BTREE_INSERT_PHASE_DONE
+ *   WAL_INSERT
+ *     WAL ring buffer ← KDS_WAL_REC_INSERT (row data)
+ *
+ *   WAL_BTREE       [need_new_page only]
+ *     WAL ring buffer ← KDS_WAL_REC_INSERT (btree leaf slot)
+ *
+ *   HEAP_INSERT
+ *     heap page buffer ← row  (dirty mark)
+ *
+ *   BTREE_INSERT    [need_new_page only]
+ *     btree leaf buffer ← slot (dirty mark)
+ *
+ *   DONE
+ *
+ *   Background checkpointer:
+ *     WAL ring buffer → WAL pages on disk
+ *     dirty page buffers → data pages on disk
  * ------------------------------------------------------------------ */
 
 typedef enum kds_btree_insert_phase {
-    KDS_BTREE_INSERT_PHASE_SEARCH = 0,
-    KDS_BTREE_INSERT_PHASE_INSERT,
+    KDS_BTREE_INSERT_PHASE_SEARCH_AND_PREPARE = 0,
+    KDS_BTREE_INSERT_PHASE_WAL_INIT_PAGE,  /* WAL: new heap page init  */
+    KDS_BTREE_INSERT_PHASE_WAL_INSERT,     /* WAL: row data            */
+    KDS_BTREE_INSERT_PHASE_WAL_BTREE,      /* WAL: btree leaf slot     */
+    KDS_BTREE_INSERT_PHASE_HEAP_INSERT,    /* data: write row to heap  */
+    KDS_BTREE_INSERT_PHASE_BTREE_INSERT,   /* data: write btree slot   */
     KDS_BTREE_INSERT_PHASE_DONE,
 } kds_btree_insert_phase_t;
 
@@ -241,16 +278,44 @@ typedef struct kds_btree_insert_exec {
 
     /* input */
     kds_relation_t           *rel;
-    kds_tuple_id_t            key;
-    kds_page_id_t             value_page_id;
+    kds_tuple_id_t            key;           /* PK of the row being inserted */
+    const void               *data;          /* encoded row payload           */
+    u16                       data_len;
 
     /* resume state */
     kds_btree_insert_phase_t  phase;
     kds_btree_cursor_t        cursor;        /* owns pinned frames during SEARCH */
-    kds_page_id_t             current_page_id; /* page being descended into next */
+    kds_page_id_t             current_page_id;
+
+    /*
+     * Set by PHASE_SEARCH: the heap page_id where key should be
+     * inserted (the value stored in the leaf slot whose min_key
+     * is the largest key <= exec->key, or root_page_id if the
+     * btree is empty / key is smaller than all existing keys).
+     */
+    kds_page_id_t             target_heap_page_id;
+
+    /*
+     * Set by PHASE_HEAP_INSERT when the target heap page was full
+     * and a new one was allocated. PHASE_BTREE_INSERT uses this to
+     * register the new page in the btree.
+     */
+    kds_page_id_t             new_heap_page_id;
+    kds_tuple_id_t            new_page_min_key; /* first key in new heap page */
+
+    /*
+     * Set by PREPARE: true when the target heap page has no room and
+     * a new page will need to be allocated. Drives conditional WAL
+     * phases (WAL_INIT_PAGE, WAL_BTREE, BTREE_INSERT).
+     */
+    bool                      need_new_page;
+
+    /* output */
+    kds_heap_tid_t            out_tid;
 } kds_btree_insert_exec_t;
 
 void kds_btree_insert_exec_init(kds_btree_insert_exec_t *exec, kds_relation_t *rel,
-                                 kds_tuple_id_t key, kds_page_id_t value_page_id);
+                                 kds_tuple_id_t key,
+                                 const void *data, u16 data_len);
 
 #endif /* __KDS_EXECUTOR_H */

@@ -428,10 +428,10 @@ static int kds_cmd_insert_row(kds_dshell_client_t        *client,
 
     } else if (rel->kind == KDS_CLUSTERED_BTREE) {
         /* --------------------------------------------------------
-         * BTREE insert: PK를 key로, root_page_id의 btree에 삽입.
-         *
-         * PK는 첫 번째 컬럼이 항상 int64라는 DB-wide 불변식을
-         * 이용해서 row_buf 첫 8바이트에서 직접 읽는다.
+         * BTREE clustered insert:
+         *   exec 내부에서 btree 탐색 → 올바른 heap 페이지 선택
+         *   → 행 삽입. heap 페이지가 가득 차면 새 페이지 할당 후
+         *   btree에 (min_key, new_page_id) 등록까지 처리한다.
          * -------------------------------------------------------- */
         kds_btree_insert_exec_t exec;
         kds_tuple_id_t          pk;
@@ -443,14 +443,7 @@ static int kds_cmd_insert_row(kds_dshell_client_t        *client,
         }
         memcpy(&pk, row_buf, sizeof(pk));
 
-        /*
-         * value_page_id: btree leaf가 가리킬 "데이터 페이지".
-         * 현재는 root_page_id 자체를 데이터 저장소로 쓰는 단순
-         * 구현이므로 0을 넣어서 "인라인 데이터 없음"으로 처리.
-         * 추후 heap 페이지를 별도로 두는 클러스터드 btree로
-         * 전환 시 heap insert → btree insert 순서로 변경할 것.
-         */
-        kds_btree_insert_exec_init(&exec, rel, pk, 0);
+        kds_btree_insert_exec_init(&exec, rel, pk, row_buf, row_len);
 
         BUILD_BUG_ON(sizeof(exec) > KDS_DSHELL_EXEC_BUF_SIZE);
         memcpy(client->exec_buf, &exec, sizeof(exec));
@@ -478,8 +471,11 @@ static int kds_cmd_insert_row(kds_dshell_client_t        *client,
             }
 
             scnprintf(out, out_size,
-                      "OK inserted into '%s' (btree) key=%lld\n",
-                      stmt->table_name, (long long)pk);
+                      "OK inserted into '%s' (btree) key=%lld "
+                      "page=%llu slot=%u\n",
+                      stmt->table_name, (long long)pk,
+                      (u64)done->out_tid.page_id,
+                      done->out_tid.slot);
         }
 
     } else {

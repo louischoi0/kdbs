@@ -334,33 +334,37 @@ void kds_heap_insert_exec_init(kds_heap_insert_exec_t *exec, kds_relation_t *rel
 
 /* ------------------------------------------------------------------
  * BtreeInsertExec implementation
+ *
+ * Clustered btree layout:
+ *   btree leaf slots: (min_key, heap_page_id)
+ *   Each slot points to a heap page holding rows for
+ *   keys in [min_key, next_slot.min_key).
+ *
+ * Insert algorithm:
+ *   SEARCH       → find leaf slot whose min_key <= key
+ *   HEAP_INSERT  → insert row into that heap page;
+ *                  if full, alloc new heap page, insert there
+ *   BTREE_INSERT → (only if new heap page allocated)
+ *                  register (key, new_page_id) in btree
  * ------------------------------------------------------------------ */
 
 /*
- * PHASE_SEARCH: descends the btree one level per iteration, storing
- * each visited node into exec->cursor. Resumable across slices:
- * exec->current_page_id is the next page to load, and exec->cursor
- * already holds all frames pinned so far.
- *
- * Unlike btree_cursor_search() (which does the whole descent in one
- * call), this drives the descent manually so it can yield between
- * levels. The search position logic mirrors btree_search_position()
- * in btree.c exactly.
- *
- * Returns:
- *   KDS_EXEC_DONE     → reached a leaf; exec->cursor is ready for
- *                        PHASE_INSERT to use directly.
- *   KDS_EXEC_ERROR    → duplicate key (base->ret = -EEXIST) or I/O
- *                        error; exec->cursor is cleaned up here.
- *   KDS_EXEC_CONTINUE → slice spent mid-descent; exec->cursor and
- *                        exec->current_page_id are checkpointed.
+ * XID placeholder used by btree insert -- same convention as heap.
+ * Replace with real transaction manager output when available.
+ */
+#define KDS_BTREE_INSERT_XID  1
+
+/*
+ * PHASE_SEARCH: descends the btree one level per iteration.
+ * On reaching the leaf sets exec->target_heap_page_id to the heap
+ * page that covers exec->key (largest min_key <= key).
  */
 static kds_exec_result_t kds_btree_insert_run_search(kds_btree_insert_exec_t *exec)
 {
     while (exec->cursor.depth < BTREE_MAX_DEPTH) {
-        kds_frame_t *frame;
+        kds_frame_t      *frame;
         kds_btree_node_t *node;
-        int pos;
+        int               pos, i;
 
         frame = kds_buf_lookup_or_load(exec->current_page_id);
         if (IS_ERR(frame)) {
@@ -372,24 +376,16 @@ static kds_exec_result_t kds_btree_insert_run_search(kds_btree_insert_exec_t *ex
         node = &exec->cursor.nodes[exec->cursor.depth];
         load_btree_node(frame, node);
 
-        /* btree_search_position(): find insertion slot for exec->key */
-        pos = 0;
-        {
-            int i;
-
-            for (i = 0; i < node->key_count; i++) {
-                if (exec->key <= node->keys[i]) {
-                    pos = i;
-                    goto pos_found;
-                }
+        pos = node->key_count;
+        for (i = 0; i < node->key_count; i++) {
+            if (exec->key <= node->keys[i]) {
+                pos = i;
+                break;
             }
-            pos = node->key_count;
-pos_found:;
         }
-
         exec->cursor.positions[exec->cursor.depth] = pos;
 
-        /* Duplicate key check */
+        /* Duplicate key check. */
         if (pos < node->key_count && node->keys[pos] == exec->key) {
             exec->base.ret = -EEXIST;
             btree_cursor_cleanup(&exec->cursor);
@@ -398,11 +394,18 @@ pos_found:;
 
         exec->base.units_done++;
 
-        /* Leaf reached -- descent complete */
-        if (node->level == 0)
+        if (node->level == 0) {
+            /*
+             * Leaf reached. slots[pos] is the heap page for exec->key.
+             * pos == 0 and key < all existing keys: use slots[0].
+             * Fall back to root_page_id if the slot is 0 (empty tree).
+             */
+            exec->target_heap_page_id = node->slots[pos];
+            if (!exec->target_heap_page_id)
+                exec->target_heap_page_id = exec->rel->root_page_id;
             return KDS_EXEC_DONE;
+        }
 
-        /* Descend one level */
         exec->current_page_id = node->slots[pos];
         exec->cursor.depth++;
 
@@ -410,57 +413,89 @@ pos_found:;
             return KDS_EXEC_CONTINUE;
     }
 
-    /* Tree deeper than BTREE_MAX_DEPTH -- shouldn't happen */
     exec->base.ret = -E2BIG;
     btree_cursor_cleanup(&exec->cursor);
     return KDS_EXEC_ERROR;
 }
 
 /*
- * PHASE_INSERT: performs the leaf insert and any required split
- * propagation. Mirrors btree_insert() in btree.c exactly, but
- * operates on the already-computed exec->cursor from PHASE_SEARCH
- * instead of calling btree_cursor_search() again.
- *
- * Treated as a single non-interruptible step: split propagation
- * touches O(tree_height) pages which is bounded (BTREE_MAX_DEPTH)
- * and fast relative to the page-load cost already paid in
- * PHASE_SEARCH -- no mid-split checkpoint needed.
+ * PHASE_HEAP_INSERT: insert exec->data into exec->target_heap_page_id.
+ * If the page is full, allocate a new heap page and record it in
+ * exec->new_heap_page_id for PHASE_BTREE_INSERT to register.
  */
-static kds_exec_result_t kds_btree_insert_run_insert(kds_btree_insert_exec_t *exec)
+static kds_exec_result_t kds_btree_insert_run_heap_insert(kds_btree_insert_exec_t *exec)
 {
-    kds_btree_node_t *leaf;
-    int pos;
-    int ret;
+    kds_frame_t *frame;
+    int          ret;
 
-    leaf = &exec->cursor.nodes[exec->cursor.depth];
-    pos  = exec->cursor.positions[exec->cursor.depth];
+    frame = kds_buf_lookup_or_load(exec->target_heap_page_id);
+    if (IS_ERR(frame)) {
+        exec->base.ret = PTR_ERR(frame);
+        return KDS_EXEC_ERROR;
+    }
 
-    if (leaf->key_count < BTREE_MAX_KEYS) {
-        /* Fast path: leaf has room */
-        btree_node_insert_at(leaf, pos, exec->key, exec->value_page_id);
-        store_btree_node(leaf);
+    ret = heap_insert_tuple(frame, exec->data, exec->data_len,
+                             KDS_BTREE_INSERT_XID, &exec->out_tid);
+    if (!ret) {
+        /* Row fit in the existing heap page -- no btree update needed. */
+        kds_buf_unpin(frame);
         exec->base.units_done++;
+        exec->new_heap_page_id = 0;
         return KDS_EXEC_DONE;
     }
 
-    /* Leaf is full: insert then split */
+    kds_buf_unpin(frame);
+
+    if (ret != -ENOSPC) {
+        exec->base.ret = ret;
+        return KDS_EXEC_ERROR;
+    }
+
+    /*
+     * Target heap page full: allocate a new one, insert there, and
+     * record it so PHASE_BTREE_INSERT can register it in the btree
+     * with min_key = exec->key.
+     */
     {
-        kds_btree_split_result_t split_result;
+        kds_frame_t *new_frame = kds_page_alloc(KDS_PAGE_TYPE_HEAP);
 
-        btree_node_insert_at(leaf, pos, exec->key, exec->value_page_id);
+        if (!new_frame) {
+            exec->base.ret = -ENOSPC;
+            return KDS_EXEC_ERROR;
+        }
 
-        ret = btree_split_node(leaf, &split_result);
-        if (ret < 0) {
+        heap_init_page(new_frame);
+
+        ret = heap_insert_tuple(new_frame, exec->data, exec->data_len,
+                                 KDS_BTREE_INSERT_XID, &exec->out_tid);
+        if (ret) {
+            kds_buf_unpin(new_frame);
             exec->base.ret = ret;
             return KDS_EXEC_ERROR;
         }
 
-        ret = btree_propagate_split(&exec->cursor, &split_result);
-        if (ret < 0) {
-            exec->base.ret = ret;
-            return KDS_EXEC_ERROR;
-        }
+        exec->new_heap_page_id = new_frame->kp->id;
+        exec->new_page_min_key = exec->key;
+        exec->base.units_done++;
+
+        kds_buf_unpin(new_frame);
+        return KDS_EXEC_DONE;
+    }
+}
+
+/*
+ * PHASE_BTREE_INSERT: register the new heap page in the btree.
+ * Uses the cursor populated by PHASE_SEARCH via kds_btree_cursor_insert(),
+ * which owns and releases the cursor's pinned frames.
+ */
+static kds_exec_result_t kds_btree_insert_run_btree_insert(kds_btree_insert_exec_t *exec)
+{
+    int ret = kds_btree_cursor_insert(&exec->cursor,
+                                       exec->new_page_min_key,
+                                       exec->new_heap_page_id);
+    if (ret < 0) {
+        exec->base.ret = ret;
+        return KDS_EXEC_ERROR;
     }
 
     exec->base.units_done++;
@@ -476,7 +511,6 @@ static kds_exec_result_t kds_btree_insert_exec_run(kds_exec_state_t *base, u64 s
         base->ret = -EINVAL;
         return KDS_EXEC_ERROR;
     }
-
     if (!exec->rel->root_page_id) {
         base->ret = -ENODEV;
         return KDS_EXEC_ERROR;
@@ -484,64 +518,74 @@ static kds_exec_result_t kds_btree_insert_exec_run(kds_exec_state_t *base, u64 s
 
     for (;;) {
         switch (exec->phase) {
+
         case KDS_BTREE_INSERT_PHASE_SEARCH: {
             kds_exec_result_t r = kds_btree_insert_run_search(exec);
-
             if (r != KDS_EXEC_DONE)
-                return r; /* ERROR or CONTINUE */
-
-            exec->phase = KDS_BTREE_INSERT_PHASE_INSERT;
+                return r;
+            exec->phase = KDS_BTREE_INSERT_PHASE_HEAP_INSERT;
             continue;
         }
 
-        case KDS_BTREE_INSERT_PHASE_INSERT: {
+        case KDS_BTREE_INSERT_PHASE_HEAP_INSERT: {
             kds_exec_result_t r;
-
-            /*
-             * Give up the slice if it expired between SEARCH and
-             * INSERT -- the cursor is safely checkpointed in exec,
-             * so resuming here on the next call is correct.
-             */
             if (kds_exec_slice_expired(base))
                 return KDS_EXEC_CONTINUE;
-
-            r = kds_btree_insert_run_insert(exec);
-
-            /*
-             * cursor holds pinned frames regardless of outcome --
-             * clean up now that the insert path (success or error)
-             * is finished. btree_cursor_cleanup() is idempotent so
-             * double-calling from error paths above is harmless.
-             */
-            btree_cursor_cleanup(&exec->cursor);
-
+            r = kds_btree_insert_run_heap_insert(exec);
             if (r != KDS_EXEC_DONE)
                 return r;
+            exec->phase = exec->new_heap_page_id
+                ? KDS_BTREE_INSERT_PHASE_BTREE_INSERT
+                : KDS_BTREE_INSERT_PHASE_DONE;
+            continue;
+        }
 
+        case KDS_BTREE_INSERT_PHASE_BTREE_INSERT: {
+            kds_exec_result_t r;
+            if (kds_exec_slice_expired(base))
+                return KDS_EXEC_CONTINUE;
+            r = kds_btree_insert_run_btree_insert(exec);
+            /* kds_btree_cursor_insert() released cursor frames. */
+            btree_cursor_cleanup(&exec->cursor);
+            if (r != KDS_EXEC_DONE)
+                return r;
             exec->phase = KDS_BTREE_INSERT_PHASE_DONE;
             continue;
         }
 
         case KDS_BTREE_INSERT_PHASE_DONE:
+            /*
+             * Fast path (no new heap page): cursor frames are still
+             * pinned from SEARCH. Release them now.
+             */
+            btree_cursor_cleanup(&exec->cursor);
             return KDS_EXEC_DONE;
         }
     }
 }
 
 void kds_btree_insert_exec_init(kds_btree_insert_exec_t *exec, kds_relation_t *rel,
-                                 kds_tuple_id_t key, kds_page_id_t value_page_id)
+                                 kds_tuple_id_t key,
+                                 const void *data, u16 data_len)
 {
-    exec->base.run        = kds_btree_insert_exec_run;
-    exec->base.ret        = 0;
+    exec->base.run         = kds_btree_insert_exec_run;
+    exec->base.ret         = 0;
     exec->base.deadline_ns = 0;
-    exec->base.units_done = 0;
+    exec->base.units_done  = 0;
 
-    exec->rel           = rel;
-    exec->key           = key;
-    exec->value_page_id = value_page_id;
+    exec->rel              = rel;
+    exec->key              = key;
+    exec->data             = data;
+    exec->data_len         = data_len;
 
-    exec->phase           = KDS_BTREE_INSERT_PHASE_SEARCH;
-    exec->current_page_id = rel ? rel->root_page_id : 0;
+    exec->phase               = KDS_BTREE_INSERT_PHASE_SEARCH;
+    exec->current_page_id     = rel ? rel->root_page_id : 0;
+    exec->target_heap_page_id = 0;
+    exec->new_heap_page_id    = 0;
+    exec->new_page_min_key    = 0;
+
+    exec->out_tid.page_id = 0;
+    exec->out_tid.slot    = 0;
 
     btree_cursor_init(&exec->cursor);
 }

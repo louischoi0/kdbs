@@ -6,6 +6,7 @@
 #include <linux/kds_dshell.h>
 #include <linux/kds_page_alloc.h>
 #include <linux/kds_catalog.h>
+#include <linux/kds_wal.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <linux/sched.h>
@@ -87,11 +88,13 @@ void kds_bootstrap(void)
     if (ret)
         return kds_bootstrap_failed("kds_init_dshell_system", ret);
 
-    // kds_init_checkpointer_system();
-
     ret = kds_init_page_alloc_system();
     if (ret)
         return kds_bootstrap_failed("kds_init_page_alloc_system", ret);
+
+    ret = kds_wal_init();
+    if (ret)
+        return kds_bootstrap_failed("kds_wal_init", ret);
 
     /*
      * Only run on a genuinely fresh database. kds_catalog_bootstrap()

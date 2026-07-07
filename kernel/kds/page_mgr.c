@@ -561,6 +561,34 @@ int kds_frame_flush(kds_frame_t *frame)
     return 0;
 }
 
+/*
+ * kds_buf_flush_dirty_frames(): flush all dirty frames in the pool
+ * to their backing data pages. Called by the WAL checkpointer after
+ * flushing the WAL ring buffer, so the data page flush always follows
+ * the WAL flush (WAL-before-data ordering).
+ */
+void kds_buf_flush_dirty_frames(void)
+{
+    int i;
+
+    if (!g_pool)
+        return;
+
+    for (i = 0; i < KDS_BUF_NR_FRAMES; i++) {
+        kds_frame_t *f = &g_pool->frames[i];
+
+        if (f->state != KDS_FRAME_VALID || !f->kp)
+            continue;
+
+        if (!(f->kp->hdr.flags & KDS_PAGE_FLAG_DIRTY))
+            continue;
+
+        kds_buf_pin(f);
+        kds_frame_flush(f);
+        kds_buf_unpin(f);
+    }
+}
+
 void kds_buf_pool_get_stats(u32 *out_total, u32 *out_free, u32 *out_valid)
 {
     u32 free_count  = 0;

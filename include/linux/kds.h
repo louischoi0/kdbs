@@ -38,8 +38,9 @@ typedef u64 kds_tuple_id_t;
 #define KDS_PAGE_TYPE_BTREE_DATA        3
 #define KDS_PAGE_TYPE_HEAP              4
 #define KDS_PAGE_TYPE_UNDO              5
-#define KDS_PAGE_TYPE_TOAST             6
-#define KDS_PAGE_TYPE_REL_TUPLE         7
+#define KDS_PAGE_TYPE_WAL               6
+#define KDS_PAGE_TYPE_TOAST             7
+
 typedef u32 kds_page_type_t;
 typedef struct kds_page_hdr {
     kds_page_type_t     type;
