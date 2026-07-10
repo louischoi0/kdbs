@@ -361,7 +361,7 @@ void kds_proc_schedule_all(u64 slice_ns)
 
 void kds_load_balance(void)
 {
-    int            src_cpu, dst_cpu;
+    int            src_cpu;
     kds_runqueue_t *src_rq, *dst_rq;
     kds_proc_t     *proc = NULL;
     unsigned int    max_load = 0, min_load = UINT_MAX;

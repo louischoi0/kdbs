@@ -258,4 +258,6 @@ int heap_delete_tuple(kds_frame_t *frame, u16 slot, u64 xmax);
  * would risk reclaiming a tuple a still-running transaction needs.
  */
 
+bool heap_has_space(kds_frame_t *frame, u16 data_len);
+
 #endif /* __KDS_HEAP_H */

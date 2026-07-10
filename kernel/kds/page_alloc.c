@@ -160,7 +160,7 @@ static kds_size_t kds_batch_alloc(kds_size_t count)
 
     base = alloc_page_id_batch(want);
     if (!base) {
-        pr_err("kds_page_alloc: alloc_page_id_batch(%zu) failed\n", want);
+        panic("kds_page_alloc: alloc_page_id_batch(%zu) failed\n", want);
         return 0;
     }
 

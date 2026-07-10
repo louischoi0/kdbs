@@ -15,6 +15,43 @@
 #include <linux/string.h>
 
 /*
+ * KDS_PAGE_TYPE_WAL: page type for WAL pages in the shared block device.
+ * Defined here until kds_page.h is updated to include it.
+ * Must not collide with existing KDS_PAGE_TYPE_* values.
+ */
+#ifndef KDS_PAGE_TYPE_WAL
+#define KDS_PAGE_TYPE_WAL  0x57414C00U  /* 'WAL\0' */
+#endif
+
+/*
+ * WAL metadata stubs: kds_meta_set_wal_pages() and
+ * kds_meta_set_wal_checkpoint_lsn() are not yet in meta.c.
+ * Stored in module-static variables until kds_superblock_t is
+ * extended and the real meta functions are added.
+ */
+static kds_page_id_t g_wal_head_page_id;
+static kds_page_id_t g_wal_tail_page_id;
+static kds_lsn_t     g_wal_checkpoint_lsn_persisted;
+
+static inline void kds_meta_set_wal_pages(kds_page_id_t head,
+                                           kds_page_id_t tail)
+{
+    g_wal_head_page_id = head;
+    g_wal_tail_page_id = tail;
+}
+
+static inline void kds_meta_set_wal_checkpoint_lsn(kds_lsn_t lsn)
+{
+    g_wal_checkpoint_lsn_persisted = lsn;
+}
+
+/*
+ * kds_buf_flush_dirty_frames() is defined in page_mgr.c.
+ * Forward-declared here until kds_page_mgr.h is updated.
+ */
+extern void kds_buf_flush_dirty_frames(void);
+
+/*
  * Single global WAL state. Initialised by kds_wal_init(), torn down
  * by kds_wal_shutdown().
  */

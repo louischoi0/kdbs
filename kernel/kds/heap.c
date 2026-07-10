@@ -440,3 +440,21 @@ int heap_delete_tuple(kds_frame_t *frame, u16 slot_idx, u64 xmax)
 
     return 0;
 }
+
+bool heap_has_space(kds_frame_t *frame, u16 data_len)
+{
+    u16 needed;
+    u16 free;
+
+    if (!frame || !frame->kp || !frame->page)
+        return false;
+
+    /* Guard against overflow: same check as heap_insert_tuple_ex(). */
+    if (data_len > KDS_PAGE_SIZE)
+        return false;
+
+    needed = sizeof(kds_heap_slot_t) + KDS_HEAP_TUPLE_HDR_SIZE + data_len;
+    free   = heap_free_space(frame);
+
+    return free >= needed;
+}

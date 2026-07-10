@@ -57,6 +57,7 @@ static int init_superblock_and_fsync(kds_superblock_t *block)
     atomic64_set(&block->free_pages, 0);
     atomic64_set(&block->last_commit_page_id, 0);
 
+    block->alloc_point = 0;
     block->create_time = ktime_get_real_seconds();
     block->last_mount_time = block->create_time;
     block->last_fsync_time = 0;
@@ -91,6 +92,8 @@ void kds_meta_set_alloc_range(kds_page_id_t alloc_point, u64 remaining)
     if (unlikely(!superblock))
         return;
 
+    pr_info("set alloc point: %d\n", alloc_point);
+
     lock_meta_superblock(&flags);
     superblock->alloc_point = alloc_point;
     superblock->alloc_remaining = remaining;
@@ -101,13 +104,8 @@ void kds_meta_get_alloc_range(kds_page_id_t *out_alloc_point, u64 *out_remaining
 {
     unsigned long flags;
 
-    if (!out_alloc_point || !out_remaining)
-        return;
-
     if (unlikely(!superblock)) {
-        *out_alloc_point = 0;
-        *out_remaining = 0;
-        return;
+        panic("superblock not initialized\n");
     }
 
     lock_meta_superblock(&flags);
@@ -198,31 +196,33 @@ static int kds_load_or_init_superblock(void)
     kunmap_local(addr);
 
     if (superblock->magic == SUPERBLOCK_MAGIC) {
-        pr_info("KDS: Superblock loaded successfully\n");
-        pr_info("  Magic: 0x%llx\n", superblock->magic);
-        pr_info("  Version: %u\n", superblock->version);
-        pr_info("  Max Page ID: %lld\n", atomic64_read(&superblock->max_page_id));
-
-        superblock->last_mount_time = ktime_get_real_seconds();
-        return 0;
+        goto done;
     }
-
-    pr_warn("KDS: Invalid superblock magic (0x%llx), initializing new one\n",
-            superblock->magic);
 
     g_fresh_init = true;
 
     ret = init_superblock_and_fsync(superblock);
     if (ret) {
-        pr_err("KDS: Failed to initialize superblock: %d\n", ret);
+        panic("KDS: Failed to initialize superblock: %d\n", ret);
         vfree(superblock);
         superblock = NULL;
         __free_pages(sb_io_page, KDS_PAGE_ORDER);
         sb_io_page = NULL;
         return ret;
     }
+    goto done;
 
-    return 0;
+    done:
+        pr_info("KDS: Superblock loaded successfully\n");
+        pr_info("  Magic: 0x%llx\n", superblock->magic);
+        pr_info("  Version: %u\n", superblock->version);
+        pr_info("  Max Page ID: %lld\n", atomic64_read(&superblock->max_page_id));
+        pr_info("  Page Alloc Point: %u\n", superblock->alloc_point);
+        superblock->last_mount_time = ktime_get_real_seconds();
+
+        pr_info("KDS: Invalid superblock magic (0x%llx), initializing new one\n",
+                superblock->magic);
+        return 0;
 }
 
 int kds_init_meta_system(void)

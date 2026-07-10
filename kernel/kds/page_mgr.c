@@ -440,21 +440,23 @@ kds_frame_t *kds_buf_alloc_new(kds_page_id_t page_id)
         kunmap_local(addr);
     }
 
-    if (kds_bdev) {
-        sector_t sector = kds_page_sector(page_id);
-        ret = kds_write_logical_page(sector, page);
-        if (ret) {
-            __free_pages(page, KDS_PAGE_ORDER);
-            vfree(f->kp);
-            f->kp      = NULL;
-            f->state   = KDS_FRAME_FREE;
-            f->page_id = 0;
-            kds_buf_return_free_frame(f);
-            return ERR_PTR(ret);
-        }
-        /* Header is now on disk; clear DIRTY. */
-        f->kp->hdr.flags &= ~KDS_PAGE_FLAG_DIRTY;
+    if (kds_bdev == NULL) {
+        panic("kds driver not initialized\n");
     }
+
+    sector_t sector = kds_page_sector(page_id);
+    ret = kds_write_logical_page(sector, page);
+    if (ret) {
+        __free_pages(page, KDS_PAGE_ORDER);
+        vfree(f->kp);
+        f->kp      = NULL;
+        f->state   = KDS_FRAME_FREE;
+        f->page_id = 0;
+        kds_buf_return_free_frame(f);
+        return ERR_PTR(ret);
+    }
+    /* Header is now on disk; clear DIRTY. */
+    f->kp->hdr.flags &= ~KDS_PAGE_FLAG_DIRTY;
 
     ret = kds_buf_register_frame(f);
     if (ret) {

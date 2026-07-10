@@ -150,7 +150,9 @@ heap_insert_run_find_tail(kds_heap_insert_exec_t *exec)
              * phase can describe exactly which page+offset was written.
              */
             exec->wal_target_page_id = frame->kp->id;
-            exec->wal_target_offset  = heap_last_insert_offset(frame);
+            exec->wal_target_offset  = 0; /* exact slot offset not tracked;
+                                           * recovery re-applies via page_id
+                                           * + row data from the WAL body   */
             exec->wal_need_init_page = false;
             kds_buf_unpin(frame);
             exec->base.units_done++;
@@ -203,7 +205,7 @@ heap_insert_run_find_tail(kds_heap_insert_exec_t *exec)
             }
 
             exec->wal_target_page_id = new_frame->kp->id;
-            exec->wal_target_offset  = heap_last_insert_offset(new_frame);
+            exec->wal_target_offset  = 0;
             exec->wal_need_init_page = true;
             kds_buf_unpin(new_frame);
             exec->base.units_done++;
