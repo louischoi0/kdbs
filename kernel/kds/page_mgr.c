@@ -139,10 +139,12 @@ static kds_frame_t *kds_buf_take_free_frame(void)
     unsigned long flags;
 
     spin_lock_irqsave(&g_pool->free_list_lock, flags);
-    if (!list_empty(&g_pool->free_frames)) {
+    if (likely(!list_empty(&g_pool->free_frames))) {
         f = list_first_entry(&g_pool->free_frames, kds_frame_t, free_node);
         list_del_init(&f->free_node);
         atomic_dec(&g_pool->nr_free);
+    } else {
+        pr_info("free frames is empty\n");
     }
     spin_unlock_irqrestore(&g_pool->free_list_lock, flags);
 
@@ -376,6 +378,7 @@ kds_frame_t *kds_buf_alloc_new(kds_page_id_t page_id)
     kds_frame_t  *f;
     struct page  *page;
     int           ret;
+    pr_info("kds_buf_alloc_new: page_id=%d\n", page_id);
 
     if (!g_pool)
         return ERR_PTR(-ENODEV);

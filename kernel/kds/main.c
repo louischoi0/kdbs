@@ -92,10 +92,6 @@ void kds_bootstrap(void)
     if (ret)
         return kds_bootstrap_failed("kds_init_page_alloc_system", ret);
 
-    ret = kds_wal_init();
-    if (ret)
-        return kds_bootstrap_failed("kds_wal_init", ret);
-
     /*
      * Only run on a genuinely fresh database. kds_catalog_bootstrap()
      * unconditionally (re)creates the fixed catalog pages (4-7) via
@@ -111,6 +107,10 @@ void kds_bootstrap(void)
         pr_info("kds: existing database detected, skipping catalog bootstrap\n");
     }
 
+    ret = kds_wal_init();
+    if (ret)
+        return kds_bootstrap_failed("kds_wal_init", ret);
+
     pr_info("kds: bootstrap completed\n");
 
     atomic_set(&kds_initialized, KDS_INIT_DONE);
@@ -124,12 +124,6 @@ static int kds_worker_fn(void *arg)
     pr_info("kds_worker: CPU%d started\n", cpu);
 
     set_cpus_allowed_ptr(current, cpumask_of(cpu));
-
-    if (cpu == 0) {
-        kds_bootstrap();
-    } else {
-        wait_event(kds_init_wait, atomic_read(&kds_initialized) != KDS_INIT_PENDING);
-    }
 
     if (atomic_read(&kds_initialized) != KDS_INIT_DONE) {
         pr_err("kds_worker: CPU%d exiting, bootstrap did not succeed\n", cpu);
@@ -157,7 +151,7 @@ static int kds_load_balancer_fn(void *arg)
 {
     pr_info("kds_load_balancer: started\n");
 
-    wait_event(kds_init_wait, atomic_read(&kds_initialized) != KDS_INIT_PENDING);
+    // wait_event(kds_init_wait, atomic_read(&kds_initialized) != KDS_INIT_PENDING);
 
     if (atomic_read(&kds_initialized) != KDS_INIT_DONE) {
         pr_err("kds_load_balancer: exiting, bootstrap did not succeed\n");
@@ -229,6 +223,7 @@ int kds_main(void)
 {
     int ret;
 
+    kds_bootstrap();
     pr_info("kds: initializing for %d CPUs\n", num_online_cpus());
 
     ret = kds_start_workers();

@@ -52,7 +52,7 @@ static int init_superblock_and_fsync(kds_superblock_t *block)
 
     block->magic = SUPERBLOCK_MAGIC;
     block->version = KDS_VERSION;
-    atomic64_set(&block->max_page_id, 0);
+    atomic64_set(&block->max_page_id, KDS_SYS_RESERVED_PAGES);
     atomic64_set(&block->total_pages, 0);
     atomic64_set(&block->free_pages, 0);
     atomic64_set(&block->last_commit_page_id, 0);
@@ -104,13 +104,20 @@ void kds_meta_get_alloc_range(kds_page_id_t *out_alloc_point, u64 *out_remaining
 {
     unsigned long flags;
 
-    if (unlikely(!superblock)) {
+    if (superblock == NULL) {
         panic("superblock not initialized\n");
     }
 
     lock_meta_superblock(&flags);
-    *out_alloc_point = superblock->alloc_point;
-    *out_remaining = superblock->alloc_remaining;
+
+    if (likely(out_alloc_point != NULL)) {
+        *out_alloc_point = superblock->alloc_point;
+    }
+
+    if (out_remaining != NULL) {
+        *out_remaining = superblock->alloc_remaining;
+    }
+
     unlock_meta_superblock(&flags);
 }
 
@@ -210,7 +217,6 @@ static int kds_load_or_init_superblock(void)
         sb_io_page = NULL;
         return ret;
     }
-    goto done;
 
     done:
         pr_info("KDS: Superblock loaded successfully\n");

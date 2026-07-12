@@ -206,10 +206,8 @@ int kds_catalog_insert_object_row(kd_oid_t oid, kd_oid_t namespace_oid,
     int ret;
 
     frame = kds_buf_lookup_or_load(KDS_CATALOG_PAGE_OBJECTS);
-    pr_debug("lookup\n");
     if (IS_ERR(frame))
         return PTR_ERR(frame);
-    pr_debug("ok\n");
 
     row.oid = oid;
     row.namespace_oid = namespace_oid;
@@ -449,6 +447,7 @@ int kds_catalog_create_table(kd_oid_t namespace_oid, const char *name,
         heap_init_page(table_root);
     } else if (clustered_type == KDS_CLUSTERED_BTREE) {
         table_root = kds_page_alloc(KDS_PAGE_TYPE_BTREE_ROOT);
+        pr_info("table_root: %d\n", table_root);
         if (!table_root) {
             return -ENOSPC;
         }
@@ -472,9 +471,11 @@ int kds_catalog_create_table(kd_oid_t namespace_oid, const char *name,
 
     ret = kds_catalog_insert_object_row(new_oid, namespace_oid, KDS_OID_TYPE_TABLE, name);
     if (ret) {
-        pr_debug("catalog insert obj row failed errno=%d\n", ret);
+        pr_info("catalog insert obj row failed errno=%d\n", ret);
         kds_buf_unpin(table_root);
         return ret;
+    } else {
+        pr_info("catalog insert obj row ok\n");
     }
 
     ret = kds_catalog_insert_relation_row(new_oid, namespace_oid, name,

@@ -81,17 +81,6 @@ static void ring_push(kds_frame_t *frame)
     g_alloc->reserved = (g_alloc->reserved + 1) % PRE_ALLOC_RING_BUFFER_SIZE;
 }
 
-/* Public count accessor used by dshell PSTA. */
-u64 kds_get_pre_alloc_count(void)
-{
-    u64 cnt;
-
-    lock_g_alloc();
-    cnt = kds_ring_count();
-    unlock_g_alloc();
-    return cnt;
-}
-
 /* ------------------------------------------------------------------
  * Consumer: hand out one pre-allocated frame
  * ------------------------------------------------------------------ */
@@ -117,6 +106,7 @@ kds_frame_t *kds_page_alloc(kds_page_type_t type)
     kds_page_lock(frame->kp);
     frame->kp->hdr.type = type;
     kds_page_unlock(frame->kp);
+    pr_info("kds_page_alloc: cursor=%d, reserved=%d, ret=%d, pgid=%d\n", g_alloc->cursor, g_alloc->reserved, frame, frame->kp->id);
 
     return frame;
 }
@@ -159,9 +149,8 @@ static kds_size_t kds_batch_alloc(kds_size_t count)
         return 0;
 
     base = alloc_page_id_batch(want);
-    if (!base) {
-        panic("kds_page_alloc: alloc_page_id_batch(%zu) failed\n", want);
-        return 0;
+    if (base == 0) {
+        base += KDS_SYS_RESERVED_PAGES;
     }
 
     /*
@@ -169,8 +158,6 @@ static kds_size_t kds_batch_alloc(kds_size_t count)
      * writing any pages. On the next boot, the reclaim scan covers
      * [base, min(base + PRE_ALLOC_NUM, max_page_id)).
      */
-    kds_meta_set_alloc_range(base, 0);
-    kds_superblock_fsync();
 
     for (i = 0; i < want; i++) {
         kds_page_id_t id    = base + i;
@@ -199,8 +186,10 @@ static kds_size_t kds_batch_alloc(kds_size_t count)
         got++;
     }
 
-    pr_debug("kds_page_alloc: batch_alloc: base=%llu want=%zu got=%zu\n",
-             (u64)base, want, got);
+    kds_meta_set_alloc_range(base, 0);
+    kds_superblock_fsync();
+
+    pr_debug("kds_page_alloc: batch_alloc: base=%llu want=%zu got=%zu\n", (u64)base, want, got);
     return got;
 }
 
@@ -301,8 +290,10 @@ kds_proc_result_t kds_proc_prealloc(struct kds_proc *proc, u64 slice_ns)
     count = kds_ring_count();
     unlock_g_alloc();
 
-    if (count < PRE_ALLOC_PAGE_THRES)
-        kds_batch_alloc(PRE_ALLOC_RING_BUFFER_SIZE - 1 - count);
+    if (count < PRE_ALLOC_PAGE_THRES) {
+        pr_info("kds_proc_prealloc has executed kds batch alloc\n");
+        kds_batch_alloc(PRE_ALLOC_RING_BUFFER_SIZE - count);
+    }
 
     return KDS_PROC_YIELD_RET;
 }
@@ -366,15 +357,13 @@ int kds_init_page_alloc_system(void)
 
     if (alloc_point == 0) {
         pr_info("kds_page_alloc: first boot -- allocating initial batch\n");
-        filled = kds_batch_alloc(PRE_ALLOC_RING_BUFFER_SIZE - 1);
+        filled = kds_batch_alloc(PRE_ALLOC_RING_BUFFER_SIZE);
     } else {
-        pr_info("kds_page_alloc: boot -- alloc_point=%llu, reclaiming\n",
-                (u64)alloc_point);
-
+        pr_info("kds_page_alloc: boot -- alloc_point=%llu, reclaiming\n", (u64)alloc_point);
         filled = kds_reclaim_uninitialized_pages(alloc_point);
 
         if (filled < PRE_ALLOC_PAGE_THRES) {
-            kds_size_t need = (PRE_ALLOC_RING_BUFFER_SIZE - 1) - filled;
+            kds_size_t need = PRE_ALLOC_RING_BUFFER_SIZE - filled;
 
             pr_info("kds_page_alloc: reclaim gave %zu page(s), "
                     "allocating %zu more\n", filled, need);
@@ -439,7 +428,7 @@ void kds_page_alloc_get_stats(kds_page_id_t *out_alloc_point,
         return;
 
     if (out_alloc_point) {
-        kds_page_id_t ap;
+    kds_page_id_t ap;
         kds_meta_get_alloc_range(&ap, NULL);
         *out_alloc_point = ap;
     }

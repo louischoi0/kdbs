@@ -14,6 +14,8 @@
 #define KDS_EXT_DATA_PAGE       1
 #define META_SUPERBLOCK_SECTOR  2048
 #define DATA_PAGE_OFFSET        32
+#define KDS_SYS_RESERVED_PAGES   128
+
 /* Sectors occupied by one logical page (KDS_PAGE_SIZE / sector size).
  * Any code converting a page_id to a disk sector MUST multiply by
  * this -- using `id` directly as a sector delta (as the old
