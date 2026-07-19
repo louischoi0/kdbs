@@ -332,21 +332,6 @@ static int kds_dshell_encode_row_from_vals(const kds_schema_t   *schema,
     return 0;
 }
 
-/*
- * Handler for KDS_STMT_INSERT.
- *
- * rel->kind를 조회해서 HEAP이면 kds_heap_insert_exec_t,
- * BTREE이면 kds_btree_insert_exec_t를 사용한다.
- *
- * HEAP: 행 전체를 인코딩해서 heap 페이지에 저장하고
- *       out_tid(page_id + slot)를 응답에 출력한다.
- *
- * BTREE: PK(첫 번째 컬럼, int64)를 key로, 인코딩된 행 전체를
- *        저장할 별도 heap 페이지 id를 value로 삼는다.
- *        현재는 행 데이터를 heap 페이지에 먼저 삽입한 뒤
- *        그 tid.page_id를 btree의 value_page_id로 넣는다.
- *        (heap insert → btree index insert 순서)
- */
 static int kds_cmd_insert_row(kds_dshell_client_t        *client,
                                const kds_stmt_insert_t    *stmt,
                                char *out, size_t out_size)
@@ -389,10 +374,8 @@ static int kds_cmd_insert_row(kds_dshell_client_t        *client,
         return ret;
     }
 
+
     if (rel->kind == KDS_CLUSTERED_HEAP) {
-        /* --------------------------------------------------------
-         * HEAP insert: 행 전체를 heap 페이지에 직접 삽입.
-         * -------------------------------------------------------- */
         kds_heap_insert_exec_t exec;
 
         kds_heap_insert_exec_init(&exec, rel, row_buf, row_len,
@@ -427,12 +410,6 @@ static int kds_cmd_insert_row(kds_dshell_client_t        *client,
         }
 
     } else if (rel->kind == KDS_CLUSTERED_BTREE) {
-        /* --------------------------------------------------------
-         * BTREE clustered insert:
-         *   exec 내부에서 btree 탐색 → 올바른 heap 페이지 선택
-         *   → 행 삽입. heap 페이지가 가득 차면 새 페이지 할당 후
-         *   btree에 (min_key, new_page_id) 등록까지 처리한다.
-         * -------------------------------------------------------- */
         kds_btree_insert_exec_t exec;
         kds_tuple_id_t          pk;
 
@@ -444,6 +421,7 @@ static int kds_cmd_insert_row(kds_dshell_client_t        *client,
         memcpy(&pk, row_buf, sizeof(pk));
 
         kds_btree_insert_exec_init(&exec, rel, pk, row_buf, row_len);
+        pr_info("btree insert exec init ok\n");
 
         BUILD_BUG_ON(sizeof(exec) > KDS_DSHELL_EXEC_BUF_SIZE);
         memcpy(client->exec_buf, &exec, sizeof(exec));

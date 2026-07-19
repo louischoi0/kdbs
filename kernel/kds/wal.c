@@ -31,7 +31,12 @@
  */
 static kds_page_id_t g_wal_head_page_id;
 static kds_page_id_t g_wal_tail_page_id;
-static kds_lsn_t     g_wal_checkpoint_lsn_persisted;
+/*
+ * Single global WAL state. Initialised by kds_wal_init(), torn down
+ * by kds_wal_shutdown().
+ */
+static kds_wal_state_t *g_wal;
+static kds_proc_t      *g_ckpt_proc;
 
 static inline void kds_meta_set_wal_pages(kds_page_id_t head,
                                            kds_page_id_t tail)
@@ -42,7 +47,7 @@ static inline void kds_meta_set_wal_pages(kds_page_id_t head,
 
 static inline void kds_meta_set_wal_checkpoint_lsn(kds_lsn_t lsn)
 {
-    g_wal_checkpoint_lsn_persisted = lsn;
+    atomic64_set(&g_wal->checkpointed_lsn, (s64) lsn);
 }
 
 /*
@@ -51,12 +56,16 @@ static inline void kds_meta_set_wal_checkpoint_lsn(kds_lsn_t lsn)
  */
 extern void kds_buf_flush_dirty_frames(void);
 
-/*
- * Single global WAL state. Initialised by kds_wal_init(), torn down
- * by kds_wal_shutdown().
- */
-static kds_wal_state_t *g_wal;
-static kds_proc_t      *g_ckpt_proc;
+static inline bool kds_wal_need_checkpoint(kds_lsn_t flush_lsn)
+{
+    return flush_lsn != (s64) KDS_LSN_INVALID && flush_lsn > atomic64_read(&g_wal->checkpointed_lsn);
+}
+
+static inline bool kds_wal_need_flush(void)
+{
+    return g_wal->buf->write_off != &g_wal->buf->flush_off;
+}
+
 
 /* ------------------------------------------------------------------
  * Helpers
@@ -299,6 +308,7 @@ int kds_wal_append(kds_wal_rec_hdr_t *hdr, const void *body,
         *out_lsn = lsn;
 
     spin_unlock(&buf->lock);
+    pr_info("kds_wal_append: current_lsn=%d, flush_lsn=%d, ckpt_lsn=%d, write_off=%d\n", buf->current_lsn, g_wal->flush_lsn, g_wal->checkpointed_lsn, buf->write_off);
     return 0;
 }
 
@@ -315,7 +325,7 @@ int kds_wal_commit(u64 xid)
     hdr.xid      = xid;
     hdr.type     = KDS_WAL_REC_COMMIT;
     hdr.body_len = sizeof(body);
-
+    pr_info("kds_wal_commit: xid=%d\n", xid);
     return kds_wal_append(&hdr, &body, &lsn);
 }
 
@@ -351,8 +361,7 @@ kds_lsn_t kds_wal_get_current_lsn(void)
 
 kds_lsn_t kds_wal_get_flush_lsn(void)
 {
-    if (!g_wal)
-        return KDS_LSN_INVALID;
+    BUG_ON(!g_wal);
     return (kds_lsn_t)atomic64_read(&g_wal->flush_lsn);
 }
 
@@ -384,8 +393,7 @@ int kds_wal_flush(void)
     u64            flush_start, flush_end;
     u64            bytes_to_flush;
 
-    if (!g_wal)
-        return -ENODEV;
+    BUG_ON(!g_wal);
 
     buf = g_wal->buf;
 
@@ -397,6 +405,8 @@ int kds_wal_flush(void)
 
     if (flush_start == flush_end)
         return 0; /* nothing to do */
+
+    pr_info("kds_wal_flush: flush_start=%d, flush_end=%d\n", flush_start, flush_end);
 
     bytes_to_flush = flush_end - flush_start;
 
@@ -537,8 +547,8 @@ int kds_wal_flush(void)
     atomic64_set(&g_wal->flush_lsn,
                  (s64)kds_lsn_make(buf->tail_page_id, buf->tail_used));
 
-    pr_debug("kds_wal: flush: flush_lsn=0x%llx\n",
-             (u64)kds_wal_get_flush_lsn());
+    pr_debug("kds_wal: flush finished. flush_lsn=0x%llx\n", (u64)kds_wal_get_flush_lsn());
+
     return 0;
 }
 
@@ -551,6 +561,7 @@ int kds_wal_checkpoint(kds_lsn_t data_flush_lsn)
     kds_wal_rec_hdr_t          hdr  = {0};
     kds_wal_body_checkpoint_t  body = {0};
     kds_lsn_t                  lsn;
+    kds_lsn_t                  flush_end_lsn;
     int                        ret;
 
     body.checkpointed_lsn = data_flush_lsn;
@@ -566,18 +577,52 @@ int kds_wal_checkpoint(kds_lsn_t data_flush_lsn)
 
     /* Flush the checkpoint record itself to disk immediately. */
     ret = kds_wal_flush();
-    if (ret)
+    if (ret) {
+        panic("kds wal flush failed %d\n", ret);
         return ret;
+    }
 
-    atomic64_set(&g_wal->checkpointed_lsn, (s64)data_flush_lsn);
+    flush_end_lsn = kds_wal_get_flush_lsn();
+    atomic64_set(&g_wal->checkpointed_lsn, (s64) flush_end_lsn);
 
     /* Persist checkpointed_lsn in superblock so recovery knows
      * where to start on the next boot. */
-    kds_meta_set_wal_checkpoint_lsn(data_flush_lsn);
+    kds_meta_set_wal_checkpoint_lsn(flush_end_lsn);
     kds_superblock_fsync();
 
-    pr_info("kds_wal: checkpoint at lsn=0x%llx\n", (u64)data_flush_lsn);
+    pr_info("kds_wal_checkpoint: checkpoint at lsn=0x%llx\n", (u64) flush_end_lsn);
     return 0;
+}
+
+kds_proc_result_t kds_wal_checkpointer_proc(struct kds_proc *proc, u64 slice_ns)
+{
+    kds_lsn_t flush_lsn;
+    int       ret;
+
+    if (!g_wal) 
+        return KDS_PROC_YIELD_RET;
+
+    if (kds_wal_need_flush()) {
+        ret = kds_wal_flush();
+        if (ret) {
+            panic("initial flush failed\n");
+        }
+    }
+
+    flush_lsn = kds_wal_get_flush_lsn();
+
+    if (!kds_wal_need_checkpoint(flush_lsn))
+        return KDS_PROC_YIELD_RET;
+
+    kds_buf_flush_dirty_frames();
+
+    ret = kds_wal_checkpoint(flush_lsn);
+    if (ret) {
+        pr_warn("kds_wal: checkpointer: checkpoint failed: %d\n", ret);
+        return KDS_PROC_YIELD_RET;
+    }
+
+    return KDS_PROC_YIELD_RET;
 }
 
 /* ------------------------------------------------------------------
@@ -703,41 +748,6 @@ done_page:
     pr_info("kds_wal: recovery complete: %llu record(s) replayed\n",
             records_replayed);
     return 0;
-}
-
-/* ------------------------------------------------------------------
- * Checkpointer proc
- * ------------------------------------------------------------------ */
-
-kds_proc_result_t kds_wal_checkpointer_proc(struct kds_proc *proc,
-                                              u64 slice_ns)
-{
-    kds_lsn_t flush_lsn;
-    int       ret;
-
-    if (!g_wal)
-        return KDS_PROC_YIELD_RET;
-
-    /* Step 1: flush WAL ring buffer → WAL pages */
-    ret = kds_wal_flush();
-    if (ret) {
-        pr_warn("kds_wal: checkpointer: flush failed: %d\n", ret);
-        return KDS_PROC_YIELD_RET;
-    }
-
-    flush_lsn = kds_wal_get_flush_lsn();
-    if (flush_lsn == KDS_LSN_INVALID)
-        return KDS_PROC_YIELD_RET;
-
-    /* Step 2: flush dirty data frames to their data pages */
-    kds_buf_flush_dirty_frames();
-
-    /* Step 3: record checkpoint */
-    ret = kds_wal_checkpoint(flush_lsn);
-    if (ret)
-        pr_warn("kds_wal: checkpointer: checkpoint failed: %d\n", ret);
-
-    return KDS_PROC_YIELD_RET;
 }
 
 int kds_wal_checkpointer_init(void)

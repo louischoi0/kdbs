@@ -239,6 +239,10 @@ int heap_read_tuple(kds_frame_t *frame, u16 slot,
                      kds_heap_tuple_hdr_t *out_hdr,
                      void *out_buf, u16 out_buf_size);
 
+int heap_read_tuple_pk(kds_frame_t *frame, u16 slot,
+                     kds_heap_tuple_hdr_t *out_hdr,
+                     void *out_buf, u16 out_buf_size);
+
 /*
  * Logical delete: stamps xmax on the tuple at `slot` without moving
  * or freeing its bytes. The tuple remains physically present (older

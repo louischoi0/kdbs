@@ -32,6 +32,11 @@ static inline kds_heap_slot_t *heap_slot_ptr(void *page_addr, u16 idx)
                                 + (size_t)idx * sizeof(kds_heap_slot_t));
 }
 
+static inline bool is_heap_insert_possible(kds_heap_page_meta_t *meta, u16 needed) 
+{
+    return ((u16)(meta->upper - meta->lower)) >= needed;
+}
+
 void heap_init_page_as(kds_frame_t *frame, kds_page_type_t type)
 {
     void *addr;
@@ -139,7 +144,9 @@ int heap_insert_tuple_ex(kds_frame_t *frame, const void *data, u16 data_len,
     addr = kmap_local_page(frame->page);
     memcpy(&meta, heap_meta_ptr(addr), KDS_HEAP_META_SIZE);
 
-    if (meta.upper < meta.lower || (u16)(meta.upper - meta.lower) < needed) {
+    pr_info("heap_insert_tuple_ex: upper=%d, lower=%d, needed=%d\n", meta.upper, meta.lower, needed);
+
+    if (!is_heap_insert_possible(&meta, needed)) {
         kunmap_local(addr);
         kds_page_unlock(frame->kp);
         return -ENOSPC;
@@ -350,9 +357,10 @@ int heap_set_next_page_id(kds_frame_t *frame, kds_page_id_t next_page_id)
     return 0;
 }
 
-int heap_read_tuple(kds_frame_t *frame, u16 slot_idx,
+
+static int _heap_read_tuple(kds_frame_t *frame, u16 slot_idx,
                      kds_heap_tuple_hdr_t *out_hdr,
-                     void *out_buf, u16 out_buf_size)
+                     void *out_buf, u16 out_buf_size, bool raise_not_size_matched)
 {
     void *addr;
     kds_heap_page_meta_t meta;
@@ -384,13 +392,13 @@ int heap_read_tuple(kds_frame_t *frame, u16 slot_idx,
     memcpy(&tuple_hdr, (char *)addr + slot.offset, KDS_HEAP_TUPLE_HDR_SIZE);
 
     if (out_buf) {
-        if (tuple_hdr.data_len > out_buf_size) {
+        if (tuple_hdr.data_len > out_buf_size && raise_not_size_matched) {
+            pr_info("tuple header data len=%d, out_buf_size=%d\n", tuple_hdr.data_len, out_buf_size);
             kunmap_local(addr);
             kds_page_unlock(frame->kp);
             return -ENOSPC;
         }
-        memcpy(out_buf, (char *)addr + slot.offset + KDS_HEAP_TUPLE_HDR_SIZE,
-               tuple_hdr.data_len);
+        memcpy(out_buf, (char *)addr + slot.offset + KDS_HEAP_TUPLE_HDR_SIZE, out_buf_size);
     }
 
     kunmap_local(addr);
@@ -398,6 +406,25 @@ int heap_read_tuple(kds_frame_t *frame, u16 slot_idx,
 
     *out_hdr = tuple_hdr;
     return 0;
+}
+
+
+int heap_read_tuple_pk(kds_frame_t *frame, u16 slot_idx,
+                     kds_heap_tuple_hdr_t *out_hdr,
+                     void *out_buf, u16 out_buf_size) 
+{
+    if (out_buf_size != 8) {
+        return -ENOSPC;
+    }
+
+    return _heap_read_tuple(frame, slot_idx, out_hdr, out_buf, out_buf_size, false);
+}
+
+int heap_read_tuple(kds_frame_t *frame, u16 slot_idx,
+                     kds_heap_tuple_hdr_t *out_hdr,
+                     void *out_buf, u16 out_buf_size)
+{
+    return _heap_read_tuple(frame, slot_idx, out_hdr, out_buf, out_buf_size, true);
 }
 
 int heap_delete_tuple(kds_frame_t *frame, u16 slot_idx, u64 xmax)

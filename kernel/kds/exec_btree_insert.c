@@ -67,12 +67,16 @@ static kds_exec_result_t
 btree_insert_run_search_and_prepare(kds_btree_insert_exec_t *exec)
 {
     /* Descend one level per call until we hit the leaf. */
+    pr_info("btree insert prepare started\n");
+
     while (exec->cursor.depth < BTREE_MAX_DEPTH) {
         kds_frame_t      *frame;
         kds_btree_node_t *node;
         int               pos, i;
 
+        pr_info("btree search: depth=%d\n", exec->cursor.depth);
         frame = kds_buf_lookup_or_load(exec->current_page_id);
+
         if (IS_ERR(frame)) {
             exec->base.ret = PTR_ERR(frame);
             btree_cursor_cleanup(&exec->cursor);
@@ -137,14 +141,15 @@ btree_insert_run_search_and_prepare(kds_btree_insert_exec_t *exec)
                     s64 existing_pk;
                     int r;
 
-                    r = heap_read_tuple(heap_frame, slot, &hdr,
-                                        pk_buf, sizeof(pk_buf));
+                    r = heap_read_tuple_pk(heap_frame, slot, &hdr, pk_buf, sizeof(pk_buf));
+
                     if (r == -ENOENT)
                         continue;
                     if (r) {
                         kds_buf_unpin(heap_frame);
                         exec->base.ret = r;
                         btree_cursor_cleanup(&exec->cursor);
+                        pr_info("heap read tuple failed\n");
                         return KDS_EXEC_ERROR;
                     }
 
@@ -162,6 +167,7 @@ btree_insert_run_search_and_prepare(kds_btree_insert_exec_t *exec)
             exec->need_new_page = !heap_has_space(heap_frame,
                                                    exec->data_len);
             kds_buf_unpin(heap_frame);
+            pr_info("btree insert prepare done\n");
             return KDS_EXEC_DONE;
         }
 
@@ -206,6 +212,8 @@ btree_insert_run_wal_init_page(kds_btree_insert_exec_t *exec)
     ret = kds_wal_append(&hdr, &body, &lsn);
     if (ret)
         pr_warn("exec_btree_insert: WAL_INIT_PAGE failed (%d)\n", ret);
+    else
+        pr_info("exec_btree_insert: lsn=(%d)\n", lsn);
 
     return KDS_EXEC_DONE;
 }
@@ -245,6 +253,8 @@ btree_insert_run_wal_insert(kds_btree_insert_exec_t *exec)
 
     if (ret)
         pr_warn("exec_btree_insert: WAL_INSERT failed (%d)\n", ret);
+    else
+        pr_info("kds_wal_insert ok for lsn=%d\n", lsn);
 
     return KDS_EXEC_DONE;
 }

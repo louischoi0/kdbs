@@ -1,1 +1,1 @@
-sh build.sh && sh run.sh
+sh resetdata.sh && sh build.sh && sh run.sh

@@ -37,6 +37,7 @@ kds_relation_t *kds_relation_open(kd_oid_t oid)
         return ERR_PTR(ret);
     }
 
+    pr_info("kds_relation_open: namespace_oid=%d, oid=%d, kind=%d root_pgid=%d\n", rel->namespace_oid, rel->oid, rel->kind, rel->root_page_id);
     return rel;
 }
 

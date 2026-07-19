@@ -206,6 +206,7 @@ int kds_catalog_insert_object_row(kd_oid_t oid, kd_oid_t namespace_oid,
     int ret;
 
     frame = kds_buf_lookup_or_load(KDS_CATALOG_PAGE_OBJECTS);
+    pr_info("kds_catalog_insert_object_row lookup frame: %d for %d \n", frame, KDS_CATALOG_PAGE_OBJECTS);
     if (IS_ERR(frame))
         return PTR_ERR(frame);
 
@@ -244,8 +245,8 @@ int kds_catalog_insert_relation_row(kd_oid_t oid, kd_oid_t namespace_oid,
     ret = heap_insert_tuple(frame, &row, sizeof(row), KDS_BOOTSTRAP_XID, &tid);
     kds_buf_unpin(frame);
 
-    pr_debug("kds_catalog: insert_relation_row: oid=%llu namespace_oid=%llu ret=%d\n",
-             (u64)oid, (u64)namespace_oid, ret);
+    pr_debug("kds_catalog: insert_relation_row: oid=%llu namespace_oid=%llu, row.clustered_type=%d, ret=%d\n",
+             (u64)oid, (u64)namespace_oid, row.clustered_type, ret);
 
     return ret;
 }
@@ -447,7 +448,6 @@ int kds_catalog_create_table(kd_oid_t namespace_oid, const char *name,
         heap_init_page(table_root);
     } else if (clustered_type == KDS_CLUSTERED_BTREE) {
         table_root = kds_page_alloc(KDS_PAGE_TYPE_BTREE_ROOT);
-        pr_info("table_root: %d\n", table_root);
         if (!table_root) {
             return -ENOSPC;
         }
@@ -474,9 +474,9 @@ int kds_catalog_create_table(kd_oid_t namespace_oid, const char *name,
         pr_info("catalog insert obj row failed errno=%d\n", ret);
         kds_buf_unpin(table_root);
         return ret;
-    } else {
-        pr_info("catalog insert obj row ok\n");
     }
+
+    pr_info("kds_catalog_create_table: catalog insert obj row ok for oid=%d\n", new_oid);
 
     ret = kds_catalog_insert_relation_row(new_oid, namespace_oid, name,
                                 table_root->kp->id, clustered_type);
@@ -645,4 +645,72 @@ int kds_catalog_init_table_access(kd_oid_t namespace_oid, kd_oid_t oid,
     out->clustered_type = (kds_clustered_type_t)row.clustered_type;
 
     return 0;
+}
+
+/* ------------------------------------------------------------------
+ * Root page_id update (for btree split/collapse and any other
+ * operation that relocates a table's/index's root page)
+ * ------------------------------------------------------------------ */
+
+/*
+ * kds_catalog_update_relation_desc_page()
+ *
+ * Updates the desc_page_id field of the sys.tables row for
+ * `table_oid` to `new_desc_page_id`, in place.
+ *
+ * This exists specifically for btree_propagate_split() (new root
+ * created, old root demoted to INTERNAL) and btree_delete()'s root
+ * collapse case (child promoted to root, old root freed) -- both
+ * left a TODO in kds_btree.c noting that whatever points callers at
+ * "the root page for this btree" must be updated, or every future
+ * lookup keeps finding the old, stale root. This is that update path.
+ *
+ * Uses heap_overwrite_tuple() rather than delete+insert: the row
+ * size is unchanged (only desc_page_id differs), so overwriting in
+ * place keeps the same slot/tid, which matters if anything else
+ * has cached this row's tid. xmin/xmax/undo_ptr are preserved as
+ * read from the existing tuple header -- this call changes the
+ * physical location the row points to, not its transactional
+ * visibility.
+ *
+ * Returns 0 on success, -ENOENT if no sys.tables row for table_oid
+ * exists, or a negative errno from the underlying heap/frame calls.
+ */
+int kds_catalog_update_relation_desc_page(kd_oid_t table_oid,
+                                           kds_page_id_t new_desc_page_id)
+{
+    kds_frame_t *frame;
+    kds_heap_tuple_hdr_t hdr;
+    kds_sys_table_t row;
+    u16 nr_slots, slot;
+    int ret = -ENOENT;
+
+    frame = kds_buf_lookup_or_load(KDS_CATALOG_PAGE_TABLES);
+    if (IS_ERR(frame))
+        return PTR_ERR(frame);
+
+    nr_slots = heap_nr_slots(frame);
+
+    for (slot = 0; slot < nr_slots; slot++) {
+        int r = heap_read_tuple(frame, slot, &hdr, &row, sizeof(row));
+
+        if (r == -ENOENT)
+            continue; /* dead slot, keep scanning */
+        if (r) {
+            ret = r;
+            goto out;
+        }
+
+        if (row.oid != table_oid)
+            continue;
+
+        row.desc_page_id = new_desc_page_id;
+
+        ret = heap_overwrite_tuple(frame, slot, &row, sizeof(row), hdr.xmin, hdr.xmax, hdr.undo_ptr);
+        goto out;
+    }
+
+out:
+    kds_buf_unpin(frame);
+    return ret;
 }

@@ -139,6 +139,7 @@ static kds_frame_t *kds_buf_take_free_frame(void)
     unsigned long flags;
 
     spin_lock_irqsave(&g_pool->free_list_lock, flags);
+
     if (likely(!list_empty(&g_pool->free_frames))) {
         f = list_first_entry(&g_pool->free_frames, kds_frame_t, free_node);
         list_del_init(&f->free_node);
@@ -287,8 +288,9 @@ kds_frame_t *kds_buf_lookup_or_load(kds_page_id_t page_id)
         return f;
 
     f = kds_buf_take_free_frame();
-    if (!f)
+    if (!f) {
         return ERR_PTR(-ENOSPC);
+    }
 
     f->state   = KDS_FRAME_LOADING;
     f->page_id = page_id;
@@ -563,6 +565,7 @@ int kds_frame_flush(kds_frame_t *frame)
     frame->kp->hdr.flags &= ~KDS_PAGE_FLAG_DIRTY;
 
     kds_page_unlock(frame->kp);
+    pr_info("kds_frame_flush: pgid=%d ok \n", frame->kp->id);
     return 0;
 }
 

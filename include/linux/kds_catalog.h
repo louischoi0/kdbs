@@ -267,4 +267,7 @@ int kds_catalog_insert_relation_row(kd_oid_t oid, kd_oid_t namespace_oid,
                                      const char *name, kds_page_id_t desc_page_id,
                                      kds_clustered_type_t clustered_type);
 
+int kds_catalog_update_relation_desc_page(kd_oid_t table_oid,
+                                           kds_page_id_t new_desc_page_id);
+
 #endif /* __KDS_CATALOG_H */

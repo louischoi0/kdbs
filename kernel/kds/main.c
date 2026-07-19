@@ -111,6 +111,10 @@ void kds_bootstrap(void)
     if (ret)
         return kds_bootstrap_failed("kds_wal_init", ret);
 
+    ret = kds_wal_checkpointer_init();
+    if (ret)
+        return kds_bootstrap_failed("kds_wal_checkpointer_init", ret);
+
     pr_info("kds: bootstrap completed\n");
 
     atomic_set(&kds_initialized, KDS_INIT_DONE);

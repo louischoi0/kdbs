@@ -3,6 +3,7 @@
 #include <linux/kds_page.h>
 #include <linux/kds_page_mgr.h>
 #include <linux/kds_page_alloc.h>
+#include <linux/kds_catalog.h>
 #include <linux/kds_meta.h>
 #include <linux/compiler.h>
 #include <linux/bug.h>
@@ -336,8 +337,11 @@ int btree_propagate_split(kds_btree_cursor_t *cursor,
         kds_btree_node_t new_root;
 
         new_root_frame = btree_alloc_new_page(KDS_PAGE_TYPE_BTREE_ROOT);
-        if (IS_ERR(new_root_frame))
+
+        if (IS_ERR(new_root_frame)) {
+            pr_info("btree insert failed to get new root frame\n");
             return PTR_ERR(new_root_frame);
+        }
 
         memset(&new_root, 0, sizeof(new_root));
         new_root.level = cursor->nodes[0].level + 1;
@@ -356,6 +360,7 @@ int btree_propagate_split(kds_btree_cursor_t *cursor,
 
         kds_buf_unpin(new_root_frame);
 
+        panic("Update root page_id in metadata not implemented\n");
         /*
          * TODO: Update root page_id in metadata -- whatever points
          * callers at "the root page for this btree" (e.g. a
@@ -477,6 +482,8 @@ int btree_insert(kds_page_id_t root_page_id, kds_tuple_id_t key,
     ret = kds_btree_cursor_search(&cursor, root_page_id, key);
     if (ret < 0)
         return ret; /* -EEXIST, I/O error, or -E2BIG; cursor already cleaned up */
+
+    pr_info("kds_btree_cursor_search ok\n");
 
     return kds_btree_cursor_insert(&cursor, key, value_page_id);
 }
