@@ -83,6 +83,7 @@ typedef enum kds_wal_rec_type {
     KDS_WAL_REC_ABORT       = 5,  /* transaction abort                       */
     KDS_WAL_REC_CHECKPOINT  = 6,  /* checkpoint: all pages up to lsn on disk */
     KDS_WAL_REC_FULL_PAGE   = 7,  /* full page write for crash safety        */
+    KDS_WAL_REC_BEGIN       = 8,  /* transaction begin (see kds_transaction) */
 } kds_wal_rec_type_t;
 
 /* ------------------------------------------------------------------
@@ -273,9 +274,20 @@ int  kds_wal_append(kds_wal_rec_hdr_t *rec_hdr, const void *body,
                     kds_lsn_t *out_lsn);
 
 /*
+ * kds_wal_begin(): append a KDS_WAL_REC_BEGIN record marking the start
+ * of transaction xid. Ring-buffer only (no flush) -- a BEGIN record is
+ * not durability-critical the way COMMIT is; recovery treats it as
+ * metadata. On success *out_lsn (may be NULL) holds the record's LSN.
+ * Used by kds_txn_begin() (kds_transaction.h).
+ */
+int  kds_wal_begin(u64 xid, kds_lsn_t *out_lsn);
+
+/*
  * kds_wal_commit(): append a KDS_WAL_REC_COMMIT record for xid into
- * the ring buffer. Does NOT flush to disk -- the checkpointer will
- * flush on its next cycle.
+ * the ring buffer. Does NOT flush to disk on its own -- callers that
+ * need commit durability (kds_txn_commit()) follow it with
+ * kds_wal_sync(); the checkpointer would otherwise flush on its next
+ * cycle.
  */
 int  kds_wal_commit(u64 xid);
 
@@ -305,10 +317,24 @@ kds_lsn_t kds_wal_get_checkpointed_lsn(void);
 
 /*
  * kds_wal_flush(): drain the ring buffer to WAL pages on disk, up to
- * the current write_lsn. Called by the checkpointer proc.
- * Returns 0 on success.
+ * the current write_lsn. Called by the checkpointer proc. Serialized
+ * internally so it is safe to call concurrently with kds_wal_sync().
+ * Returns 0 on success, -ENODEV if the WAL is not initialised.
  */
 int  kds_wal_flush(void);
+
+/*
+ * kds_wal_sync(): synchronously drain the WAL ring buffer to WAL pages
+ * on disk right now, in the caller's context. Used by the insert and
+ * update paths to make a data modification's WAL record durable before
+ * the operation reports success, instead of waiting for the background
+ * checkpointer's next cycle. Shares kds_wal_flush()'s serialization, so
+ * a synchronous flush and the checkpointer never race on the WAL tail
+ * page. Best-effort: returns -ENODEV (not a crash) if the WAL is not
+ * initialised, so callers on the "continue without WAL" path can invoke
+ * it unconditionally. Returns 0 once the records are on disk.
+ */
+int  kds_wal_sync(void);
 
 /*
  * kds_wal_checkpoint(): after flushing dirty data pages up to

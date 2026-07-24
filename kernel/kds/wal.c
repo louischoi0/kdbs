@@ -13,6 +13,7 @@
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/string.h>
+#include <linux/mutex.h>
 
 /*
  * KDS_PAGE_TYPE_WAL: page type for WAL pages in the shared block device.
@@ -37,6 +38,16 @@ static kds_page_id_t g_wal_tail_page_id;
  */
 static kds_wal_state_t *g_wal;
 static kds_proc_t      *g_ckpt_proc;
+
+/*
+ * Serializes every drain of the WAL ring buffer to disk. Previously
+ * only the single background checkpointer called the flush routine;
+ * now the insert/update paths also flush synchronously (kds_wal_sync()),
+ * so concurrent flushes must be serialized -- the flush manipulates the
+ * WAL tail page (tail_page_id / tail_used / tail_seg_no) outside
+ * buf->lock, and two flushes running at once would corrupt it.
+ */
+static DEFINE_MUTEX(g_wal_flush_lock);
 
 static inline void kds_meta_set_wal_pages(kds_page_id_t head,
                                            kds_page_id_t tail)
@@ -316,6 +327,23 @@ int kds_wal_append(kds_wal_rec_hdr_t *hdr, const void *body,
  * kds_wal_commit / kds_wal_abort
  * ------------------------------------------------------------------ */
 
+int kds_wal_begin(u64 xid, kds_lsn_t *out_lsn)
+{
+    kds_wal_rec_hdr_t     hdr = {0};
+    kds_wal_body_xact_t   body = { .xid = xid };
+    kds_lsn_t             lsn;
+    int                   ret;
+
+    hdr.xid      = xid;
+    hdr.type     = KDS_WAL_REC_BEGIN;
+    hdr.body_len = sizeof(body);
+
+    ret = kds_wal_append(&hdr, &body, &lsn);
+    if (out_lsn)
+        *out_lsn = ret ? KDS_LSN_INVALID : lsn;
+    return ret;
+}
+
 int kds_wal_commit(u64 xid)
 {
     kds_wal_rec_hdr_t     hdr = {0};
@@ -387,7 +415,7 @@ kds_lsn_t kds_wal_get_checkpointed_lsn(void)
  *   3. After all bytes are written, update flush_lsn.
  * ------------------------------------------------------------------ */
 
-int kds_wal_flush(void)
+static int wal_flush_locked(void)
 {
     kds_wal_buf_t *buf;
     u64            flush_start, flush_end;
@@ -550,6 +578,37 @@ int kds_wal_flush(void)
     pr_debug("kds_wal: flush finished. flush_lsn=0x%llx\n", (u64)kds_wal_get_flush_lsn());
 
     return 0;
+}
+
+/*
+ * Public flush entry point. Serializes wal_flush_locked() under
+ * g_wal_flush_lock so the background checkpointer and any synchronous
+ * flush (kds_wal_sync()) can never drain the ring concurrently. Returns
+ * -ENODEV rather than crashing if the WAL is not up, so best-effort
+ * callers can invoke it unconditionally.
+ */
+int kds_wal_flush(void)
+{
+    int ret;
+
+    if (!g_wal)
+        return -ENODEV;
+
+    mutex_lock(&g_wal_flush_lock);
+    ret = wal_flush_locked();
+    mutex_unlock(&g_wal_flush_lock);
+    return ret;
+}
+
+/*
+ * Synchronous commit-time flush. Identical durability to the
+ * checkpointer's flush (kds_frame_flush() issues submit_bio_wait() per
+ * WAL page), just driven inline from the insert/update path so the WAL
+ * record is on disk before the operation returns.
+ */
+int kds_wal_sync(void)
+{
+    return kds_wal_flush();
 }
 
 /* ------------------------------------------------------------------
@@ -726,6 +785,7 @@ int kds_wal_recover(void)
             case KDS_WAL_REC_CHECKPOINT:
                 pr_debug("kds_wal: recovery: found CHECKPOINT record\n");
                 break;
+            case KDS_WAL_REC_BEGIN:
             case KDS_WAL_REC_COMMIT:
             case KDS_WAL_REC_ABORT:
                 /* transaction state handled by transaction manager */

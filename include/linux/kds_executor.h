@@ -5,6 +5,7 @@
 #include <linux/kds_relation.h>
 #include <linux/kds_heap.h>
 #include <linux/kds_btree.h>
+#include <linux/kds_parser.h>
 #include <linux/ktime.h>
 
 /*
@@ -317,5 +318,212 @@ typedef struct kds_btree_insert_exec {
 void kds_btree_insert_exec_init(kds_btree_insert_exec_t *exec, kds_relation_t *rel,
                                  kds_tuple_id_t key,
                                  const void *data, u16 data_len);
+
+/* ------------------------------------------------------------------
+ * SelectExec
+ *
+ * Scans a table -- heap-clustered (a chain of heap pages) or
+ * btree-clustered (a leaf-level chain of range-bucketed heap pages,
+ * per exec_btree_insert.c's SEARCH_AND_PREPARE phase: each btree leaf
+ * key marks the start of a heap "bucket" page holding every row in
+ * that key range) -- applying WHERE conditions, resumable and
+ * time-sliced exactly like the insert execs above.
+ *
+ * Unlike insert, which dispatches to two free-standing struct types
+ * by rel->kind at the call site, select's heap/btree resume state is
+ * unioned inside ONE struct tagged implicitly by rel->kind -- callers
+ * (dshell.c) only ever hold a single kds_select_exec_t regardless of
+ * a table's clustering, the same way kds_relation_t already unifies
+ * heap/btree access behind one handle.
+ *
+ * Output is a difference from the insert execs: rather than leaving
+ * response formatting to the caller after DONE, this exec streams
+ * matched rows directly into the caller-owned out_buf/out_size
+ * (dshell.c hands it client->resp_buf) as they're found, because the
+ * row count is unbounded and truncation has to be decided live
+ * against the buffer's remaining space. out_pos is checkpointed in
+ * the struct like every other piece of progress, so a CONTINUE
+ * resumes appending exactly where the last call left off.
+ * ------------------------------------------------------------------ */
+
+typedef enum kds_select_phase {
+    KDS_SELECT_PHASE_SCAN = 0,
+    KDS_SELECT_PHASE_DONE,
+} kds_select_phase_t;
+
+/*
+ * A WHERE condition with its column name already resolved to a
+ * schema index, so the hot scan path never re-does a string lookup
+ * per row. Resolved once, synchronously, in kds_select_exec_init().
+ */
+typedef struct kds_select_resolved_cond {
+    u32            col_idx;
+    kds_cond_op_t  op;
+    kds_ast_val_t  val;
+} kds_select_resolved_cond_t;
+
+typedef struct kds_select_exec {
+    kds_exec_state_t            base;
+
+    /* input, set by kds_select_exec_init() */
+    kds_relation_t               *rel;
+    kds_select_resolved_cond_t    conds[KDS_PARSER_MAX_CONDS];
+    u32                           nr_conds;
+
+    /* output: streamed directly into caller-owned text buffer */
+    char                         *out_buf;
+    size_t                        out_size;
+    size_t                        out_pos;
+    u32                           rows_matched;
+    u32                           pages_visited;
+    bool                          truncated;
+
+    /* --------------------------------------------------------------
+     * Resume state -- see kds_heap_insert_exec_t's comment on why
+     * none of this may live on run()'s C stack.
+     * -------------------------------------------------------------- */
+    kds_select_phase_t            phase;
+
+    /*
+     * Planner flag: when set, a WHERE equality on an indexed column was
+     * resolved to a single row-page via kds_index_search(), so the scan
+     * visits only cursor_page_id (never following heap `next` links or
+     * walking btree leaves) and stops. cursor_page_id == 0 in this mode
+     * means the index proved no row matches -- scan nothing. All WHERE
+     * conditions are still applied per row on that one page, so extra
+     * AND-conditions remain correct. Set in kds_select_exec_init().
+     */
+    bool                          index_single_page;
+
+    /*
+     * The heap page currently being scanned row-by-row: the chain
+     * page itself for a heap-clustered table, or the btree leaf's
+     * current bucket page for a btree-clustered one. cursor_slot is
+     * the next slot to read within it.
+     */
+    kds_page_id_t                 cursor_page_id;
+    u16                           cursor_slot;
+
+    /*
+     * btree-only resume state (unused when rel->kind == KDS_CLUSTERED_HEAP).
+     * No kds_btree_cursor_t here on purpose -- a read-only scan never
+     * needs to keep a whole root-to-leaf path pinned for a later
+     * write like the insert exec's cursor does; it only needs the
+     * *current* leaf's slot ids and its right sibling to keep walking.
+     */
+    struct {
+        bool           descending;              /* still walking root -> leftmost leaf */
+        u32            slot_idx;                /* next slot in the current leaf */
+        u32            key_count;                /* current leaf's key_count (cached) */
+        kds_page_id_t  slot_ids[BTREE_MAX_KEYS + 1]; /* current leaf's heap bucket ids */
+        kds_page_id_t  leaf_next_page_id;        /* current leaf's right sibling, 0 = last leaf */
+    } btree;
+} kds_select_exec_t;
+
+/*
+ * Resolves conds against rel->schema and initializes the exec.
+ * Returns 0 on success, or fails synchronously (before any run() call
+ * -- no I/O needed for this step) with:
+ *   -ENOENT     a WHERE column name isn't in rel->schema
+ *   -EOPNOTSUPP an ordering op (<, <=, >, >=) was used on a column
+ *               type with no compare_fn (kds_types.h) -- currently
+ *               float/decimal/bool/varchar/char. EQ/NEQ work on every
+ *               type via raw encoded-byte comparison and don't need
+ *               compare_fn.
+ */
+int kds_select_exec_init(kds_select_exec_t *exec, kds_relation_t *rel,
+                          const kds_ast_cond_t *conds, u32 nr_conds,
+                          char *out_buf, size_t out_size);
+
+/* ------------------------------------------------------------------
+ * UpdateExec
+ *
+ * Applies SET assignments to every row matching the WHERE clause of an
+ * UPDATE statement. Structured exactly like SelectExec: one unified
+ * kds_update_exec_t tagged by rel->kind, dispatched to a heap or btree
+ * run() by kds_update_exec_init(); the two scan strategies live in
+ * exec_heap_update.c / exec_btree_update.c and share the per-page
+ * apply helper (kds_exec_update.h). It is resumable and time-sliced the
+ * same way, and reuses SelectExec's resolved-condition form for WHERE.
+ *
+ * The actual per-row modification goes through kds_heap_update_tuple()
+ * (kds_undo.h): prior version copied to an undo entry, new value either
+ * overwritten in place or retired+reinserted, and the change WAL-logged
+ * and synchronously flushed. To avoid re-updating a row that the
+ * retire+insert path just appended at a higher slot, each page is
+ * scanned only up to the slot count it had when first entered
+ * (page_slot_limit).
+ *
+ * PRIMARY KEY: assigning to column 0 (the fixed INT64 PK) is rejected
+ * by kds_update_exec_init() with -EPERM -- the PK positional convention
+ * the whole engine relies on must not be mutated by an UPDATE.
+ *
+ * Output: unlike SelectExec, no per-row streaming -- only a final
+ * summary line ("OK N row(s) updated ...") written by kds_update_finish().
+ * ------------------------------------------------------------------ */
+
+typedef enum kds_update_phase {
+    KDS_UPDATE_PHASE_SCAN = 0,
+    KDS_UPDATE_PHASE_DONE,
+} kds_update_phase_t;
+
+/* A SET assignment with its column name resolved to a schema index. */
+typedef struct kds_update_resolved_assign {
+    u32            col_idx;
+    kds_ast_val_t  val;
+} kds_update_resolved_assign_t;
+
+typedef struct kds_update_exec {
+    kds_exec_state_t              base;
+
+    /* input, set by kds_update_exec_init() */
+    kds_relation_t               *rel;
+    u64                           xid;
+    kd_oid_t                      owner_oid;    /* rel->oid, stamped into undo */
+    kds_update_resolved_assign_t  assigns[KDS_SCHEMA_MAX_COLUMNS];
+    u32                           nr_assigns;
+    kds_select_resolved_cond_t    conds[KDS_PARSER_MAX_CONDS];
+    u32                           nr_conds;
+
+    /* output: only the final summary is written here (in finish) */
+    char                         *out_buf;
+    size_t                        out_size;
+    u32                           rows_matched;
+    u32                           rows_updated;
+    u32                           pages_visited;
+
+    /* --------------------------------------------------------------
+     * Resume state -- see kds_heap_insert_exec_t's comment on why none
+     * of this may live on run()'s C stack.
+     * -------------------------------------------------------------- */
+    kds_update_phase_t            phase;
+    kds_page_id_t                 cursor_page_id;
+    u16                           cursor_slot;
+    u16                           page_slot_limit;  /* nr_slots snapshot at page entry */
+
+    /* btree-only resume state (unused for KDS_CLUSTERED_HEAP), same
+     * shape as SelectExec's leaf/bucket walk. */
+    struct {
+        bool           descending;
+        u32            slot_idx;
+        u32            key_count;
+        kds_page_id_t  slot_ids[BTREE_MAX_KEYS + 1];
+        kds_page_id_t  leaf_next_page_id;
+    } btree;
+} kds_update_exec_t;
+
+/*
+ * Resolves assignments and WHERE conditions against rel->schema and
+ * initializes the exec. Synchronous (no I/O); fails before any run()
+ * with:
+ *   -ENOENT      a SET or WHERE column name isn't in rel->schema
+ *   -EPERM       a SET targets column 0 (the primary key)
+ *   -EOPNOTSUPP  an ordering op on a WHERE column type with no compare_fn
+ *   -EINVAL      no assignments, or too many
+ */
+int kds_update_exec_init(kds_update_exec_t *exec, kds_relation_t *rel,
+                          const kds_ast_assign_t *assigns, u32 nr_assigns,
+                          const kds_ast_cond_t *conds, u32 nr_conds,
+                          u64 xid, char *out_buf, size_t out_size);
 
 #endif /* __KDS_EXECUTOR_H */

@@ -44,6 +44,16 @@ typedef enum kds_type_val {
     KDS_TYPE_BOOL    = 6,
     KDS_TYPE_VARCHAR = 7,
     KDS_TYPE_CHAR    = 8,
+    /*
+     * Unsigned 64-bit integer. The engine's essential self-constraint:
+     * every table's first column is the PRIMARY KEY and is forced to
+     * this type (see kds_cmd_create_table()). Same 8-byte little-endian
+     * storage as INT64, but parsed/compared/formatted UNSIGNED — the
+     * full 0..2^64-1 range, negative literals rejected. The btree key
+     * type (kds_tuple_id_t) is already u64, so this makes the PK's
+     * comparison semantics match the clustering key's.
+     */
+    KDS_TYPE_UINT64  = 9,
 } kds_type_val_t;
 
 /*

@@ -3,6 +3,7 @@
 #include <linux/kds_catalog.h>
 #include <linux/kds_types.h>
 #include <linux/kds_relation.h>
+#include <linux/kds_index_maint.h>
 #include <linux/kds_executor.h>
 #include <linux/kds_heap.h>
 #include <linux/kds_page_mgr.h>
@@ -85,9 +86,20 @@ typedef enum {
     KDS_DSHELL_EXEC_PENDING = 1,
 } kds_dshell_exec_state_t;
 
-#define KDS_DSHELL_EXEC_BUF_SIZE  \
-    (sizeof(kds_heap_insert_exec_t) > sizeof(kds_btree_insert_exec_t) \
-     ? sizeof(kds_heap_insert_exec_t) : sizeof(kds_btree_insert_exec_t))
+/*
+ * The client's single inline exec_buf must be able to hold whichever
+ * exec a command sets up: heap/btree insert, or select. Select's exec
+ * struct is the largest (it carries resolved WHERE conditions), so it
+ * dominates the max -- if a new, larger exec type is added, extend
+ * this max the same way.
+ */
+#define KDS_DSHELL_MAX2(a, b)  ((a) > (b) ? (a) : (b))
+#define KDS_DSHELL_EXEC_BUF_SIZE                                            \
+    KDS_DSHELL_MAX2(                                                        \
+        KDS_DSHELL_MAX2(KDS_DSHELL_MAX2(sizeof(kds_heap_insert_exec_t),     \
+                                        sizeof(kds_btree_insert_exec_t)),   \
+                        sizeof(kds_select_exec_t)),                         \
+        sizeof(kds_update_exec_t))
 
 typedef struct kds_dshell_client {
     /* response staging for read() */
@@ -145,53 +157,10 @@ static int kds_dshell_submit_insert_exec(kds_dshell_client_t *client,
 #define KDS_DSHELL_ROW_MAX  256
 
 /*
- * Decodes a binary row into a human-readable "col=val, ..." string.
- * Used by kds_cmd_scan_table() to format SELC output.
+ * Row decoding for SELECT output now lives inside the select executor
+ * (exec_heap_select.c), which formats matched rows directly into the
+ * response buffer as it scans -- see kds_cmd_select() below.
  */
-static int kds_dshell_decode_row(const kds_schema_t *schema, const u8 *buf,
-                                  u16 buf_len, char *out, size_t out_size)
-{
-    size_t off = 0;
-    u32    i;
-    int    n = 0;
-
-    for (i = 0; i < schema->nr_cols; i++) {
-        const kds_sys_column_t *col  = &schema->cols[i];
-        const kds_type_desc_t  *desc =
-            kds_type_lookup_by_val((kds_type_val_t)col->type_val);
-        u16 value_len;
-        int decoded;
-
-        if (!desc)
-            return -EINVAL;
-
-        if (i > 0)
-            n += scnprintf(out + n, out_size - n, ", ");
-
-        if (desc->fixed_len == 0) {
-            if (off + sizeof(u16) > buf_len)
-                return -EINVAL;
-            memcpy(&value_len, buf + off, sizeof(u16));
-            off += sizeof(u16);
-        } else {
-            value_len = desc->fixed_len;
-        }
-
-        if ((u32)off + value_len > buf_len)
-            return -EINVAL;
-
-        n += scnprintf(out + n, out_size - n, "%s=", col->name);
-
-        decoded = desc->decode(buf + off, value_len, out + n, out_size - n);
-        if (decoded < 0)
-            return decoded;
-        n += decoded;
-
-        off += value_len;
-    }
-
-    return n;
-}
 
 /*
  * Handler for KDS_STMT_CREATE_TABLE.
@@ -227,18 +196,24 @@ static int kds_cmd_create_table(const kds_stmt_create_table_t *stmt,
     schema->nr_cols = stmt->nr_cols;
 
     /*
-     * DB-wide constraint: the first column must be the primary key
-     * and must be int64. The parser does not enforce this because it
-     * has no knowledge of DB semantics -- enforce it here, at the
-     * boundary between parsing and catalog access.
+     * DB-wide self-constraint: the first column is the PRIMARY KEY and
+     * is a 64-bit UNSIGNED integer -- the system forces it. The parser
+     * doesn't know DB semantics, so enforce it here. Accept a declared
+     * uint64 or int64 (both are 8-byte 64-bit ints) for ergonomics, then
+     * FORCE the stored type to uint64 so every PK path is unsigned;
+     * reject anything else.
      */
-    if (schema->cols[0].type_val != KDS_TYPE_INT64) {
+    if (schema->cols[0].type_val != KDS_TYPE_UINT64 &&
+        schema->cols[0].type_val != KDS_TYPE_INT64) {
         scnprintf(out, out_size,
-                  "ERR first column ('%s') must be the primary key and type int64\n",
+                  "ERR first column ('%s') must be the primary key "
+                  "(declare it uint64 or int64)\n",
                   schema->cols[0].name);
         kfree(schema);
         return -EINVAL;
     }
+    schema->cols[0].type_val = KDS_TYPE_UINT64;
+    schema->cols[0].len      = 8;
 
     ret = kds_catalog_create_table(KDS_OID_NAMESPACE_PUBLIC,
                                     stmt->table_name, schema,
@@ -284,47 +259,28 @@ static int kds_dshell_encode_row_from_vals(const kds_schema_t   *schema,
             return -EINVAL;
 
         /*
-         * Convert the AST value to a string representation that the
-         * type descriptor's encode() function can consume. encode()
-         * always takes a NUL-terminated string input -- this is the
-         * same convention kds_dshell_encode_row() used via argv[].
+         * Encode via the shared kds_encode_ast_val() so INSERT, UPDATE,
+         * and WHERE all agree on literal encoding (and so a uint64 PK's
+         * full range round-trips). Variable-width columns get a u16
+         * length prefix; fixed-width columns are written in place.
          */
-        {
-            char val_str[KDS_PARSER_VAL_MAX];
-
-            switch (val->type) {
-            case KDS_VAL_INT:
-                scnprintf(val_str, sizeof(val_str), "%lld", (long long)val->int_val);
-                break;
-            case KDS_VAL_STR:
-                strncpy(val_str, val->str_val, sizeof(val_str) - 1);
-                val_str[sizeof(val_str) - 1] = '\0';
-                break;
-            case KDS_VAL_NULL:
-                val_str[0] = '\0';
-                break;
-            default:
-                return -EINVAL;
-            }
-
-            if (desc->fixed_len == 0) {
-                if (off + sizeof(u16) > buf_size)
-                    return -ENOSPC;
-                ret = desc->encode(val_str, buf + off + sizeof(u16),
-                                   buf_size - off - sizeof(u16), &written_len);
-                if (ret)
-                    return ret;
-                memcpy(buf + off, &written_len, sizeof(u16));
-                off += sizeof(u16) + written_len;
-            } else {
-                if (off + desc->fixed_len > buf_size)
-                    return -ENOSPC;
-                ret = desc->encode(val_str, buf + off,
-                                   buf_size - off, &written_len);
-                if (ret)
-                    return ret;
-                off += written_len;
-            }
+        if (desc->fixed_len == 0) {
+            if (off + sizeof(u16) > buf_size)
+                return -ENOSPC;
+            ret = kds_encode_ast_val(desc, val, buf + off + sizeof(u16),
+                                     buf_size - off - sizeof(u16), &written_len);
+            if (ret)
+                return ret;
+            memcpy(buf + off, &written_len, sizeof(u16));
+            off += sizeof(u16) + written_len;
+        } else {
+            if (off + desc->fixed_len > buf_size)
+                return -ENOSPC;
+            ret = kds_encode_ast_val(desc, val, buf + off,
+                                     buf_size - off, &written_len);
+            if (ret)
+                return ret;
+            off += written_len;
         }
     }
 
@@ -439,8 +395,8 @@ static int kds_cmd_insert_row(kds_dshell_client_t        *client,
             if (done->base.ret != 0) {
                 if (done->base.ret == -EEXIST)
                     scnprintf(out, out_size,
-                              "ERR duplicate key %lld in '%s'\n",
-                              (long long)pk, stmt->table_name);
+                              "ERR duplicate key %llu in '%s'\n",
+                              (unsigned long long)pk, stmt->table_name);
                 else
                     scnprintf(out, out_size,
                               "ERR btree insert failed: %d\n",
@@ -449,9 +405,9 @@ static int kds_cmd_insert_row(kds_dshell_client_t        *client,
             }
 
             scnprintf(out, out_size,
-                      "OK inserted into '%s' (btree) key=%lld "
+                      "OK inserted into '%s' (btree) key=%llu "
                       "page=%llu slot=%u\n",
-                      stmt->table_name, (long long)pk,
+                      stmt->table_name, (unsigned long long)pk,
                       (u64)done->out_tid.page_id,
                       done->out_tid.slot);
         }
@@ -468,33 +424,36 @@ static int kds_cmd_insert_row(kds_dshell_client_t        *client,
 }
 
 /*
- * SELC <table_name> -- scans and prints every live tuple in the
- * table's single heap page.
+ * SELECT * FROM <table> [WHERE <cond> [AND <cond>]*]
+ *
+ * Drives the resumable, time-sliced SelectExec (kds_select_exec_t --
+ * exec_heap_select.c for heap-clustered tables, exec_btree_select.c for
+ * btree-clustered ones) through the same proc machinery insert uses, so
+ * a large scan is spread across scheduler slices instead of hogging one
+ * write() call. The exec streams matched rows straight into the
+ * response buffer (`out`, which is client->resp_buf) as it scans, so on
+ * completion the response is already formatted; this handler only sets
+ * the exec up, keeps the relation open for the whole run, and maps a
+ * synchronous init failure to an ERR line.
+ *
+ * WHERE-column resolution happens synchronously in kds_select_exec_init()
+ * (no I/O); only the scan itself is deferred to the proc.
  */
-/*
- * SELC <table_name> -- scans and prints every live tuple in the
- * table's heap page chain: starts at the table's root page
- * (kds_relation_t.root_page_id) and follows next_page_id (heap.h)
- * forward until it hits 0 (end of chain). This is a full scan with
- * no index of any kind -- there's no way to jump directly to a
- * particular page, only to walk the whole chain start to finish.
- */
-static int kds_cmd_scan_table(const kds_stmt_select_t *stmt,
-                               char *out, size_t out_size)
+static int kds_cmd_select(kds_dshell_client_t     *client,
+                          const kds_stmt_select_t *stmt,
+                          char *out, size_t out_size)
 {
-    const char *table_name = stmt->table_name;
-    kd_oid_t oid;
-    kds_relation_t *rel;
-    kds_page_id_t current_page_id;
-    u32 page_index = 0;
-    u32 total_slots = 0;
-    int n;
-    int ret;
-    bool truncated = false;
+    kd_oid_t           oid;
+    kds_relation_t    *rel;
+    kds_select_exec_t *exec;
+    int                ret;
 
-    ret = kds_catalog_find_table_oid_by_name(table_name, &oid);
+    BUILD_BUG_ON(sizeof(kds_select_exec_t) > KDS_DSHELL_EXEC_BUF_SIZE);
+
+    ret = kds_catalog_find_table_oid_by_name(stmt->table_name, &oid);
     if (ret) {
-        scnprintf(out, out_size, "ERR table '%s' not found: %d\n", table_name, ret);
+        scnprintf(out, out_size, "ERR table '%s' not found: %d\n",
+                  stmt->table_name, ret);
         return ret;
     }
 
@@ -505,65 +464,142 @@ static int kds_cmd_scan_table(const kds_stmt_select_t *stmt,
         return ret;
     }
 
-    if (rel->kind != KDS_CLUSTERED_HEAP) {
-        scnprintf(out, out_size, "ERR '%s' is not heap-clustered\n", table_name);
+    if (rel->kind != KDS_CLUSTERED_HEAP && rel->kind != KDS_CLUSTERED_BTREE) {
+        scnprintf(out, out_size,
+                  "ERR '%s' has unsupported clustered type %d\n",
+                  stmt->table_name, rel->kind);
         kds_relation_close(rel);
         return -EINVAL;
     }
 
-    n = scnprintf(out, out_size, "OK ");
-    current_page_id = rel->root_page_id;
-
-    while (current_page_id != 0 && !truncated) {
-        kds_frame_t *frame;
-        u16 nr_slots, slot;
-
-        frame = kds_buf_lookup_or_load(current_page_id);
-        if (IS_ERR(frame)) {
-            n += scnprintf(out + n, out_size - n,
-                            "\nERR lookup_or_load(page %llu) failed: %ld\n",
-                            (u64)current_page_id, PTR_ERR(frame));
-            kds_relation_close(rel);
-            return PTR_ERR(frame);
-        }
-
-        nr_slots = heap_nr_slots(frame);
-
-        for (slot = 0; slot < nr_slots; slot++) {
-            kds_heap_tuple_hdr_t hdr;
-            u8 row_buf[KDS_DSHELL_ROW_MAX];
-            int r;
-
-            r = heap_read_tuple(frame, slot, &hdr, row_buf, sizeof(row_buf));
-            if (r == -ENOENT)
-                continue; /* dead slot */
-            if (r)
-                break;
-
-            if ((size_t)n + 16 >= out_size) {
-                n += scnprintf(out + n, out_size - n, "...(truncated)\n");
-                truncated = true;
-                break;
-            }
-
-            n += scnprintf(out + n, out_size - n,
-                            "\n  page=%llu [%u] xmin=%llu xmax=%llu ",
-                            (u64)current_page_id, slot, hdr.xmin, hdr.xmax);
-            n += kds_dshell_decode_row(&rel->schema, row_buf, hdr.data_len,
-                                        out + n, out_size - n);
-            total_slots++;
-        }
-
-        current_page_id = truncated ? 0 : heap_get_next_page_id(frame);
-        kds_buf_unpin(frame);
-        page_index++;
+    /*
+     * Build the exec directly in the client's exec_buf: the struct is
+     * large (it carries the resolved WHERE conditions) and must outlive
+     * this stack frame anyway, since the proc runs it asynchronously.
+     * Init writes the "OK " prefix into `out` and resolves the WHERE
+     * columns; the run() calls that follow do the actual scanning.
+     */
+    exec = (kds_select_exec_t *)client->exec_buf;
+    ret = kds_select_exec_init(exec, rel,
+                               stmt->conds,
+                               stmt->has_where ? stmt->nr_conds : 0,
+                               out, out_size);
+    if (ret) {
+        if (ret == -ENOENT)
+            scnprintf(out, out_size,
+                      "ERR unknown column in WHERE clause\n");
+        else if (ret == -EOPNOTSUPP)
+            scnprintf(out, out_size,
+                      "ERR ordering comparison unsupported for that column type\n");
+        else
+            scnprintf(out, out_size, "ERR select init failed: %d\n", ret);
+        kds_relation_close(rel);
+        return ret;
     }
 
+    ret = kds_dshell_run_exec_via_proc(client);
+
+    /*
+     * Keep the relation open until the exec has fully finished: the
+     * scan dereferences rel->schema and rel->root_page_id on the proc's
+     * call stack, so rel must outlive the run (mirrors
+     * kds_cmd_insert_row()).
+     */
     kds_relation_close(rel);
 
-    if (!truncated)
-        n += scnprintf(out + n, out_size - n,
-                        "\n%u row(s) across %u page(s)\n", total_slots, page_index);
+    if (ret == -ETIMEDOUT)
+        return ret;
+
+    /*
+     * On DONE the response (OK + rows + summary) was already streamed
+     * into resp_buf by the exec. On ERROR, kds_dshell_proc_run() has
+     * already replaced it with an "ERR exec failed: N" line. Either
+     * way `out` is fully populated -- just surface the exec's errno.
+     */
+    if (exec->base.ret != 0)
+        return exec->base.ret;
+
+    return 0;
+}
+
+/*
+ * UPDATE <table> SET <col>=<val>[,...] [WHERE ...]
+ *
+ * Drives the resumable UpdateExec (kds_update_exec_t --
+ * exec_heap_update.c / exec_btree_update.c) through the same proc
+ * machinery insert/select use. The exec applies the SET values to every
+ * WHERE-matching row (via kds_heap_update_tuple: undo + synchronous WAL)
+ * and writes only a summary line into the response buffer on completion.
+ * WHERE/SET resolution -- including rejecting an attempt to SET the
+ * primary key -- happens synchronously in kds_update_exec_init().
+ */
+static int kds_cmd_update(kds_dshell_client_t     *client,
+                          const kds_stmt_update_t *stmt,
+                          char *out, size_t out_size)
+{
+    kd_oid_t           oid;
+    kds_relation_t    *rel;
+    kds_update_exec_t *exec;
+    int                ret;
+
+    BUILD_BUG_ON(sizeof(kds_update_exec_t) > KDS_DSHELL_EXEC_BUF_SIZE);
+
+    ret = kds_catalog_find_table_oid_by_name(stmt->table_name, &oid);
+    if (ret) {
+        scnprintf(out, out_size, "ERR table '%s' not found: %d\n",
+                  stmt->table_name, ret);
+        return ret;
+    }
+
+    rel = kds_relation_open(oid);
+    if (IS_ERR(rel)) {
+        ret = PTR_ERR(rel);
+        scnprintf(out, out_size, "ERR relation_open failed: %d\n", ret);
+        return ret;
+    }
+
+    if (rel->kind != KDS_CLUSTERED_HEAP && rel->kind != KDS_CLUSTERED_BTREE) {
+        scnprintf(out, out_size,
+                  "ERR '%s' has unsupported clustered type %d\n",
+                  stmt->table_name, rel->kind);
+        kds_relation_close(rel);
+        return -EINVAL;
+    }
+
+    exec = (kds_update_exec_t *)client->exec_buf;
+    ret = kds_update_exec_init(exec, rel,
+                               stmt->assigns, stmt->nr_assigns,
+                               stmt->conds,
+                               stmt->has_where ? stmt->nr_conds : 0,
+                               KDS_DSHELL_XID, out, out_size);
+    if (ret) {
+        if (ret == -ENOENT)
+            scnprintf(out, out_size,
+                      "ERR unknown column in SET or WHERE clause\n");
+        else if (ret == -EPERM)
+            scnprintf(out, out_size,
+                      "ERR cannot UPDATE the primary key column\n");
+        else if (ret == -EOPNOTSUPP)
+            scnprintf(out, out_size,
+                      "ERR ordering comparison unsupported for that column type\n");
+        else
+            scnprintf(out, out_size, "ERR update init failed: %d\n", ret);
+        kds_relation_close(rel);
+        return ret;
+    }
+
+    ret = kds_dshell_run_exec_via_proc(client);
+
+    /* Keep the relation open across the run (mirrors kds_cmd_select). */
+    kds_relation_close(rel);
+
+    if (ret == -ETIMEDOUT)
+        return ret;
+
+    /* On DONE the summary is already in resp_buf; on ERROR the proc
+     * wrote "ERR exec failed: N". Surface the exec's errno. */
+    if (exec->base.ret != 0)
+        return exec->base.ret;
 
     return 0;
 }
@@ -655,6 +691,126 @@ static int kds_cmd_show_page_alloc_status(char *out, size_t out_size)
  * was done by kds_parse() before this is called.
  * ------------------------------------------------------------------ */
 
+/*
+ * Handler for KDS_STMT_CREATE_INDEX -- CREATE INDEX <name> ON <table> (<col>);
+ *
+ * Runs inline like CREATE TABLE: resolve the table + column, enforce the
+ * index constraints (integer column, unique, not already indexed), create
+ * the index relation + its sys.indexes row, then backfill the index from
+ * the table's existing rows. Backfill is synchronous -- CREATE INDEX is a
+ * one-shot DDL op on small edge-node tables, not a time-sliced query.
+ *
+ * On a duplicate-value column the backfill fails with -EEXIST after the
+ * index relation and its catalog rows already exist, leaving an empty/
+ * partial index (there is no DROP INDEX yet -- resetdata.sh to clear).
+ * Proper rollback needs transactional DDL the engine doesn't have; flagged
+ * rather than fixed here.
+ */
+static int kds_cmd_create_index(const kds_stmt_create_index_t *stmt,
+                                char *out, size_t out_size)
+{
+    kd_oid_t                table_oid, index_oid;
+    kds_relation_t         *table_rel, *index_rel;
+    const kds_sys_column_t *col;
+    kds_sys_index_t         existing;
+    u32                     col_idx;
+    int                     ret;
+
+    ret = kds_catalog_find_table_oid_by_name(stmt->table_name, &table_oid);
+    if (ret) {
+        scnprintf(out, out_size, "ERR table '%s' not found: %d\n",
+                  stmt->table_name, ret);
+        return ret;
+    }
+
+    table_rel = kds_relation_open(table_oid);
+    if (IS_ERR(table_rel)) {
+        ret = PTR_ERR(table_rel);
+        scnprintf(out, out_size, "ERR relation_open failed: %d\n", ret);
+        return ret;
+    }
+
+    col = kds_schema_find_column(&table_rel->schema, stmt->col_name);
+    if (!col) {
+        scnprintf(out, out_size, "ERR column '%s' not found in table '%s'\n",
+                  stmt->col_name, stmt->table_name);
+        kds_relation_close(table_rel);
+        return -ENOENT;
+    }
+    col_idx = (u32)(col - table_rel->schema.cols);
+
+    if (!kds_index_type_supported(col->type_val)) {
+        scnprintf(out, out_size,
+                  "ERR can only index integer columns (int8/16/32/64); "
+                  "'%s' is not\n", stmt->col_name);
+        kds_relation_close(table_rel);
+        return -EOPNOTSUPP;
+    }
+
+    /* Reject a second index on the same column. */
+    ret = kds_catalog_find_index_on_column(table_oid, col_idx, &existing);
+    if (ret == 0) {
+        scnprintf(out, out_size,
+                  "ERR column '%s' is already indexed (index oid=%llu)\n",
+                  stmt->col_name, (u64)existing.index_oid);
+        kds_relation_close(table_rel);
+        return -EEXIST;
+    } else if (ret != -ENOENT) {
+        scnprintf(out, out_size, "ERR index lookup failed: %d\n", ret);
+        kds_relation_close(table_rel);
+        return ret;
+    }
+
+    /* Create the index relation (btree root + sys.objects/sys.tables). */
+    ret = kds_relation_create_index(table_rel->namespace_oid, table_oid,
+                                    stmt->col_name, &index_oid);
+    if (ret) {
+        scnprintf(out, out_size, "ERR create index relation failed: %d\n", ret);
+        kds_relation_close(table_rel);
+        return ret;
+    }
+
+    /* Record which column it keys, for maintenance + planner. */
+    ret = kds_catalog_insert_index_row(index_oid, table_oid, col_idx,
+                                       col->type_val, KDS_INDEX_FLAG_UNIQUE);
+    if (ret) {
+        scnprintf(out, out_size, "ERR sys.indexes insert failed: %d\n", ret);
+        kds_relation_close(table_rel);
+        return ret;
+    }
+
+    /* Backfill from existing rows. */
+    index_rel = kds_relation_open(index_oid);
+    if (IS_ERR(index_rel)) {
+        ret = PTR_ERR(index_rel);
+        scnprintf(out, out_size, "ERR open new index failed: %d\n", ret);
+        kds_relation_close(table_rel);
+        return ret;
+    }
+
+    ret = kds_index_backfill(index_rel, table_rel, col_idx);
+    kds_relation_close(index_rel);
+    kds_relation_close(table_rel);
+
+    if (ret == -EEXIST) {
+        scnprintf(out, out_size,
+                  "ERR column '%s' has duplicate values; a unique index "
+                  "cannot be built (index left partial -- resetdata to clear)\n",
+                  stmt->col_name);
+        return ret;
+    }
+    if (ret) {
+        scnprintf(out, out_size, "ERR index backfill failed: %d\n", ret);
+        return ret;
+    }
+
+    scnprintf(out, out_size,
+              "OK index '%s' created on %s(%s), oid=%llu\n",
+              stmt->index_name, stmt->table_name, stmt->col_name,
+              (u64)index_oid);
+    return 0;
+}
+
 static int kds_dispatch_stmt(kds_dshell_client_t *client,
                               const kds_stmt_t    *stmt,
                               char *out, size_t out_size)
@@ -663,11 +819,17 @@ static int kds_dispatch_stmt(kds_dshell_client_t *client,
     case KDS_STMT_CREATE_TABLE:
         return kds_cmd_create_table(&stmt->create_table, out, out_size);
 
+    case KDS_STMT_CREATE_INDEX:
+        return kds_cmd_create_index(&stmt->create_index, out, out_size);
+
     case KDS_STMT_INSERT:
         return kds_cmd_insert_row(client, &stmt->insert, out, out_size);
 
     case KDS_STMT_SELECT:
-        return kds_cmd_scan_table(&stmt->select, out, out_size);
+        return kds_cmd_select(client, &stmt->select, out, out_size);
+
+    case KDS_STMT_UPDATE:
+        return kds_cmd_update(client, &stmt->update, out, out_size);
 
     case KDS_STMT_SHOW_META:
         return kds_cmd_show_meta(out, out_size);

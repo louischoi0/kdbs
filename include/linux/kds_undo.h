@@ -87,21 +87,36 @@ int kds_undo_write_entry(kds_frame_t *undo_frame, kd_oid_t owner_oid,
 int kds_undo_read_entry(kds_frame_t *undo_frame, u16 slot,
                          kds_undo_entry_t *out_entry);
 
+/* ------------------------------------------------------------------
+ * Undo-page manager
+ *
+ * The update path needs somewhere to write undo entries. Rather than
+ * making every caller hand-manage a KDS_PAGE_TYPE_UNDO page and its
+ * rotation, undo.c owns a single current undo "tail" page: it is
+ * allocated lazily on first use and rotated (a fresh page allocated)
+ * when full. kds_heap_update_tuple() drives it internally, so callers
+ * only pass the row change.
+ * ------------------------------------------------------------------ */
+
+int  kds_undo_init(void);
+void kds_undo_shutdown(void);
+
 /*
  * Updates the tuple at (target_frame, slot_idx):
  *   1. Reads the current tuple version.
- *   2. Copies it into a new undo entry on undo_frame, chained onto
- *      whatever undo entry the current version already pointed at
- *      (prev_undo_ptr = current tuple's undo_ptr), so the full
- *      history remains reachable.
+ *   2. Copies it into a new undo entry on the current undo page
+ *      (allocated/rotated internally), chained onto whatever undo
+ *      entry the current version already pointed at (prev_undo_ptr =
+ *      current tuple's undo_ptr), so the full history stays reachable.
  *   3. If new_data fits within the existing slot's reserved space,
  *      overwrites in place (HOT-style). Otherwise retires the old
- *      slot and inserts the new value as a new tuple -- this may
- *      land on target_frame itself if there's room, or fail with
- *      -ENOSPC if not (see the file-level note above: no cross-page
- *      relocation here).
- *   4. Either way, the resulting live tuple's undo_ptr is stamped
- *      with the new undo entry's address.
+ *      slot and inserts the new value as a new tuple -- this may land
+ *      on target_frame itself if there's room, or fail with -ENOSPC
+ *      if not (see the file-level note above: no cross-page relocation
+ *      here).
+ *   4. Either way, the resulting live tuple's undo_ptr is stamped with
+ *      the new undo entry's address, and the change is written-ahead
+ *      logged and flushed synchronously (see undo.c).
  *
  * Returns -EMSGSIZE if the tuple's current payload exceeds
  * KDS_UNDO_MAX_OLD_DATA (can't be recorded in an undo entry yet).
@@ -112,7 +127,6 @@ int kds_undo_read_entry(kds_frame_t *undo_frame, u16 slot,
 int kds_heap_update_tuple(kds_frame_t *target_frame, u16 slot_idx,
                           const void *new_data, u16 new_data_len,
                           u64 xid, kd_oid_t owner_oid,
-                          kds_frame_t *undo_frame,
                           kds_heap_tid_t *out_tid);
 
 #endif /* __KDS_UNDO_H */

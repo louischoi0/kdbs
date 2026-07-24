@@ -145,6 +145,57 @@ static int compare_int64_generic(const void *a, u16 a_len, const void *b, u16 b_
     return (av > bv) - (av < bv);
 }
 
+/* ------------------------------------------------------------------
+ * Unsigned 64-bit (the forced primary-key type). Full 0..2^64-1 range,
+ * negative literals rejected, unsigned comparison.
+ * ------------------------------------------------------------------ */
+
+static int encode_uint64(const char *str_val, void *buf, size_t buf_size, u16 *out_len)
+{
+    u64 v;
+    int ret;
+
+    if (buf_size < 8)
+        return -ENOSPC;
+
+    /* The PK is unsigned: an explicit negative literal is a constraint
+     * violation, not a wrap-around. Reject it up front (kstrtoull also
+     * refuses a '-', but be explicit about the intent). */
+    if (str_val[0] == '-')
+        return -ERANGE;
+
+    ret = kstrtoull(str_val, 10, &v);
+    if (ret)
+        return ret;
+
+    memcpy(buf, &v, 8);
+    *out_len = 8;
+    return 0;
+}
+
+static int decode_uint64(const void *buf, u16 len, char *out, size_t out_size)
+{
+    u64 v;
+
+    if (len != 8)
+        return -EINVAL;
+
+    memcpy(&v, buf, 8);
+    return scnprintf(out, out_size, "%llu", v);
+}
+
+static int compare_uint64(const void *a, u16 a_len, const void *b, u16 b_len)
+{
+    u64 av, bv;
+
+    if (a_len != 8 || b_len != 8)
+        return 0; /* malformed -- treat as equal rather than guessing */
+
+    memcpy(&av, a, 8);
+    memcpy(&bv, b, 8);
+    return (av > bv) - (av < bv);
+}
+
 static int compare_int8(const void *a, u16 al, const void *b, u16 bl)  { return compare_int64_generic(a, al, b, bl, 1); }
 static int compare_int16(const void *a, u16 al, const void *b, u16 bl) { return compare_int64_generic(a, al, b, bl, 2); }
 static int compare_int32(const void *a, u16 al, const void *b, u16 bl) { return compare_int64_generic(a, al, b, bl, 4); }
@@ -334,6 +385,7 @@ static const kds_type_desc_t kds_type_table[] = {
     { KDS_TYPE_BOOL,    "bool",    1, encode_bool,    decode_bool,    NULL },
     { KDS_TYPE_VARCHAR, "varchar", 0, encode_varchar, decode_varchar, NULL },
     { KDS_TYPE_CHAR,    "char",    0, encode_varchar, decode_varchar, NULL },
+    { KDS_TYPE_UINT64,  "uint64",  8, encode_uint64,  decode_uint64,  compare_uint64 },
 };
 
 #define KDS_TYPE_TABLE_COUNT (sizeof(kds_type_table) / sizeof(kds_type_table[0]))

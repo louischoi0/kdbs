@@ -78,12 +78,14 @@
 #define KDS_OID_TYPE_INT32          27
 #define KDS_OID_TYPE_FLOAT          28
 #define KDS_OID_TYPE_DECIMAL        29
+#define KDS_OID_TYPE_UINT64         30   /* forced primary-key type */
 #define KDS_OID_TYPE_INT64          KDS_OID_TYPE_INT
 
 #define KDS_OID_SYS_TYPES_TABLE     100
 #define KDS_OID_SYS_OBJECTS_TABLE   110
 #define KDS_OID_SYS_COLUMNS_TABLE   111
 #define KDS_OID_SYS_TABLES_TABLE    112
+#define KDS_OID_SYS_INDEXES_TABLE   113
 #define KDS_OID_SYS_PROC_TABLE      114
 
 /* Starting point for user-created object oids -- mirrors catalog.py's
@@ -91,7 +93,7 @@
  * doc comment below for the persistence caveat. */
 #define KDS_USER_OID_START          4000
 
-/* Fixed page_ids for the four bootstrap catalog heap pages.
+/* Fixed page_ids for the bootstrap catalog heap pages.
  * These are reserved -- kds_buf_alloc_new() is called with these
  * exact values during kds_catalog_bootstrap(), they are never handed
  * out by the general-purpose allocator (kds_page_alloc.c). */
@@ -99,6 +101,14 @@
 #define KDS_CATALOG_PAGE_COLUMNS    5
 #define KDS_CATALOG_PAGE_OBJECTS    6
 #define KDS_CATALOG_PAGE_TABLES     7
+/*
+ * sys.indexes -- one row per secondary index, recording which column
+ * of which table it keys and the index relation's own oid. Added after
+ * the original four fixed pages, so it only exists on databases
+ * bootstrapped after this change (an older kdb.img must be re-created
+ * with resetdata.sh before CREATE INDEX works). See kds_sys_index_t.
+ */
+#define KDS_CATALOG_PAGE_INDEXES    8
 
 /* Transaction id stamped on every bootstrap-time tuple. Mirrors
  * PostgreSQL's FrozenTransactionId convention: bootstrap rows are
@@ -152,6 +162,28 @@ typedef struct kds_sys_type {
     u32         type_val;
     u32         len;
 } __attribute__((packed)) kds_sys_type_t;
+
+/*
+ * sys.indexes row: one per secondary index.
+ *   index_oid  -- the index relation's oid (its sys.tables/sys.objects
+ *                 row; its btree root is that row's desc_page_id).
+ *   table_oid  -- the table the index is built on.
+ *   col_pos    -- position of the indexed column in the table schema
+ *                 (kds_sys_column_t.pos).
+ *   col_type   -- the indexed column's kds_types.h type_val, so INSERT/
+ *                 UPDATE maintenance can decode the key without a schema
+ *                 lookup.
+ *   flags      -- KDS_INDEX_FLAG_* bitmask.
+ */
+#define KDS_INDEX_FLAG_UNIQUE   0x1u   /* the only mode supported today */
+
+typedef struct kds_sys_index {
+    kd_oid_t    index_oid;
+    kd_oid_t    table_oid;
+    u32         col_pos;
+    u32         col_type;
+    u8          flags;
+} __attribute__((packed)) kds_sys_index_t;
 
 /* ------------------------------------------------------------------
  * In-memory schema (built from sys.columns rows for a given rel_id)
@@ -269,5 +301,32 @@ int kds_catalog_insert_relation_row(kd_oid_t oid, kd_oid_t namespace_oid,
 
 int kds_catalog_update_relation_desc_page(kd_oid_t table_oid,
                                            kds_page_id_t new_desc_page_id);
+
+/* ------------------------------------------------------------------
+ * sys.indexes access
+ * ------------------------------------------------------------------ */
+
+/* Appends a sys.indexes row. Called by the CREATE INDEX handler after
+ * the index relation itself has been created. */
+int kds_catalog_insert_index_row(kd_oid_t index_oid, kd_oid_t table_oid,
+                                  u32 col_pos, u32 col_type, u8 flags);
+
+/*
+ * Collects every sys.indexes row for `table_oid` into out[0..max-1],
+ * writing the number found to *count. Returns 0 on success (including
+ * *count == 0 when the table has no indexes), or a negative errno.
+ * Used by INSERT/UPDATE maintenance to find the indexes to keep in sync.
+ */
+int kds_catalog_find_indexes_for_table(kd_oid_t table_oid,
+                                        kds_sys_index_t *out, u32 max,
+                                        u32 *count);
+
+/*
+ * Finds the index (if any) on (table_oid, col_pos) and copies its row
+ * to *out. Returns 0, -ENOENT if no such index exists, or a negative
+ * errno. Used by the planner to pick an index for a WHERE equality.
+ */
+int kds_catalog_find_index_on_column(kd_oid_t table_oid, u32 col_pos,
+                                      kds_sys_index_t *out);
 
 #endif /* __KDS_CATALOG_H */

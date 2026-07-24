@@ -176,6 +176,7 @@ void kds_catalog_init_well_known_objects(void)
     register_type(KDS_OID_TYPE_INT32, "type_int32");
     register_type(KDS_OID_TYPE_FLOAT, "type_float");
     register_type(KDS_OID_TYPE_DECIMAL, "type_decimal");
+    register_type(KDS_OID_TYPE_UINT64, "type_uint64");
 }
 
 /* ------------------------------------------------------------------
@@ -322,6 +323,7 @@ int kds_catalog_bootstrap(void)
         { KDS_OID_SYS_OBJECTS_TABLE, "objects", KDS_CATALOG_PAGE_OBJECTS },
         { KDS_OID_SYS_COLUMNS_TABLE, "columns", KDS_CATALOG_PAGE_COLUMNS },
         { KDS_OID_SYS_TABLES_TABLE,  "tables",  KDS_CATALOG_PAGE_TABLES  },
+        { KDS_OID_SYS_INDEXES_TABLE, "indexes", KDS_CATALOG_PAGE_INDEXES },
     };
     int ret;
     u32 i;
@@ -383,6 +385,7 @@ int kds_catalog_bootstrap(void)
             { KDS_OID_TYPE_INT16,   "int16"   },
             { KDS_OID_TYPE_INT32,   "int32"   },
             { KDS_OID_TYPE_INT64,   "int64"   },
+            { KDS_OID_TYPE_UINT64,  "uint64"  },
             { KDS_OID_TYPE_FLOAT,   "float"   },
             { KDS_OID_TYPE_DECIMAL, "decimal" },
             { KDS_OID_TYPE_BOOL,    "bool"    },
@@ -711,6 +714,112 @@ int kds_catalog_update_relation_desc_page(kd_oid_t table_oid,
     }
 
 out:
+    kds_buf_unpin(frame);
+    return ret;
+}
+
+/* ------------------------------------------------------------------
+ * sys.indexes access
+ * ------------------------------------------------------------------ */
+
+int kds_catalog_insert_index_row(kd_oid_t index_oid, kd_oid_t table_oid,
+                                  u32 col_pos, u32 col_type, u8 flags)
+{
+    kds_frame_t     *frame;
+    kds_sys_index_t  row = {0};
+    kds_heap_tid_t   tid;
+    int              ret;
+
+    frame = kds_buf_lookup_or_load(KDS_CATALOG_PAGE_INDEXES);
+    if (IS_ERR(frame))
+        return PTR_ERR(frame);
+
+    row.index_oid = index_oid;
+    row.table_oid = table_oid;
+    row.col_pos   = col_pos;
+    row.col_type  = col_type;
+    row.flags     = flags;
+
+    ret = heap_insert_tuple(frame, &row, sizeof(row), KDS_BOOTSTRAP_XID, &tid);
+    kds_buf_unpin(frame);
+    return ret;
+}
+
+int kds_catalog_find_indexes_for_table(kd_oid_t table_oid,
+                                        kds_sys_index_t *out, u32 max,
+                                        u32 *count)
+{
+    kds_frame_t          *frame;
+    kds_heap_tuple_hdr_t  hdr;
+    u16                   nr_slots, slot;
+    u32                   n = 0;
+
+    if (!out || !count)
+        return -EINVAL;
+
+    *count = 0;
+
+    frame = kds_buf_lookup_or_load(KDS_CATALOG_PAGE_INDEXES);
+    if (IS_ERR(frame))
+        return PTR_ERR(frame);
+
+    nr_slots = heap_nr_slots(frame);
+
+    for (slot = 0; slot < nr_slots && n < max; slot++) {
+        kds_sys_index_t row;
+        int r = heap_read_tuple(frame, slot, &hdr, &row, sizeof(row));
+
+        if (r == -ENOENT)
+            continue; /* dead slot */
+        if (r) {
+            kds_buf_unpin(frame);
+            return r;
+        }
+
+        if (row.table_oid == table_oid)
+            out[n++] = row;
+    }
+
+    kds_buf_unpin(frame);
+    *count = n;
+    return 0;
+}
+
+int kds_catalog_find_index_on_column(kd_oid_t table_oid, u32 col_pos,
+                                      kds_sys_index_t *out)
+{
+    kds_frame_t          *frame;
+    kds_heap_tuple_hdr_t  hdr;
+    u16                   nr_slots, slot;
+    int                   ret = -ENOENT;
+
+    if (!out)
+        return -EINVAL;
+
+    frame = kds_buf_lookup_or_load(KDS_CATALOG_PAGE_INDEXES);
+    if (IS_ERR(frame))
+        return PTR_ERR(frame);
+
+    nr_slots = heap_nr_slots(frame);
+
+    for (slot = 0; slot < nr_slots; slot++) {
+        kds_sys_index_t row;
+        int r = heap_read_tuple(frame, slot, &hdr, &row, sizeof(row));
+
+        if (r == -ENOENT)
+            continue;
+        if (r) {
+            ret = r;
+            break;
+        }
+
+        if (row.table_oid == table_oid && row.col_pos == col_pos) {
+            *out = row;
+            ret = 0;
+            break;
+        }
+    }
+
     kds_buf_unpin(frame);
     return ret;
 }

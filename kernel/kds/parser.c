@@ -308,6 +308,14 @@ static int parse_value(kds_parser_t *p, kds_ast_val_t *val)
     case KDS_TOK_INT_LIT:
         val->type    = KDS_VAL_INT;
         val->int_val = tok.int_val;
+        /*
+         * Preserve the raw literal digits too: int_val is s64 and
+         * overflows for PK values above S64_MAX, but the digits survive
+         * here so kds_encode_ast_val() can encode the full unsigned
+         * 64-bit range for a uint64 column.
+         */
+        strncpy(val->str_val, tok.text, KDS_PARSER_VAL_MAX - 1);
+        val->str_val[KDS_PARSER_VAL_MAX - 1] = '\0';
         return 0;
 
     case KDS_TOK_STR_LIT:
@@ -440,6 +448,41 @@ static int parse_create_table(kds_parser_t *p, kds_stmt_create_table_t *out)
             /* any other identifier is left for the semicolon/EOF check */
         }
     }
+
+    consume_optional_semicolon(p);
+    return 0;
+}
+
+/*
+ * CREATE INDEX <name> ON <table> (<col>);
+ *
+ * Cursor is positioned after the CREATE keyword on entry (the caller
+ * peeked "INDEX" to route here; this consumes it).
+ */
+static int parse_create_index(kds_parser_t *p, kds_stmt_create_index_t *out)
+{
+    int ret;
+
+    ret = expect_keyword(p, "INDEX");
+    if (ret) return ret;
+
+    ret = parse_ident(p, out->index_name, sizeof(out->index_name));
+    if (ret) return ret;
+
+    ret = expect_keyword(p, "ON");
+    if (ret) return ret;
+
+    ret = parse_ident(p, out->table_name, sizeof(out->table_name));
+    if (ret) return ret;
+
+    ret = expect_token(p, KDS_TOK_LPAREN, "'('");
+    if (ret) return ret;
+
+    ret = parse_ident(p, out->col_name, sizeof(out->col_name));
+    if (ret) return ret;
+
+    ret = expect_token(p, KDS_TOK_RPAREN, "')'");
+    if (ret) return ret;
 
     consume_optional_semicolon(p);
     return 0;
@@ -588,6 +631,96 @@ static int parse_select(kds_parser_t *p, kds_stmt_select_t *out)
 }
 
 /*
+ * UPDATE <name> SET <col> = <val> [, <col> = <val>]*
+ *                   [WHERE <cond> [AND <cond>]*];
+ *
+ * Cursor is positioned after UPDATE on entry.
+ */
+static int parse_update(kds_parser_t *p, kds_stmt_update_t *out)
+{
+    int ret;
+
+    ret = parse_ident(p, out->table_name, sizeof(out->table_name));
+    if (ret) return ret;
+
+    ret = expect_keyword(p, "SET");
+    if (ret) return ret;
+
+    out->nr_assigns = 0;
+    out->has_where  = false;
+    out->nr_conds   = 0;
+
+    /* One or more SET assignments joined by commas. */
+    for (;;) {
+        kds_ast_assign_t *a;
+
+        if (out->nr_assigns >= KDS_PARSER_MAX_COLS) {
+            parser_err(p, "too many SET assignments (max %d)",
+                       KDS_PARSER_MAX_COLS);
+            return -EINVAL;
+        }
+        a = &out->assigns[out->nr_assigns];
+
+        ret = parse_ident(p, a->col_name, sizeof(a->col_name));
+        if (ret) return ret;
+
+        ret = expect_token(p, KDS_TOK_EQ, "'='");
+        if (ret) return ret;
+
+        ret = parse_value(p, &a->val);
+        if (ret) return ret;
+
+        out->nr_assigns++;
+
+        {
+            const kds_token_t *peek = lexer_peek(&p->lex);
+
+            if (peek->type == KDS_TOK_COMMA) {
+                lexer_next(&p->lex);
+                continue;
+            }
+        }
+        break;
+    }
+
+    /* Optional WHERE clause -- identical shape to SELECT. */
+    {
+        const kds_token_t *peek = lexer_peek(&p->lex);
+
+        if (peek->type == KDS_TOK_IDENT &&
+            strcasecmp(peek->text, "WHERE") == 0) {
+            lexer_next(&p->lex); /* consume WHERE */
+            out->has_where = true;
+
+            for (;;) {
+                const kds_token_t *next_peek;
+
+                if (out->nr_conds >= KDS_PARSER_MAX_CONDS) {
+                    parser_err(p, "too many WHERE conditions (max %d)",
+                               KDS_PARSER_MAX_CONDS);
+                    return -EINVAL;
+                }
+
+                ret = parse_one_cond(p, &out->conds[out->nr_conds]);
+                if (ret) return ret;
+                out->nr_conds++;
+
+                next_peek = lexer_peek(&p->lex);
+                if (next_peek->type == KDS_TOK_IDENT &&
+                    strcasecmp(next_peek->text, "AND") == 0) {
+                    lexer_next(&p->lex);
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+
+    consume_optional_semicolon(p);
+    return 0;
+}
+
+/*
  * SHOW META | SHOW ALLOC
  *
  * Cursor is positioned after SHOW on entry.
@@ -649,8 +782,16 @@ int kds_parse(const char *sql, kds_stmt_t *out_stmt,
     }
 
     if (strcasecmp(tok.text, "CREATE") == 0) {
-        out_stmt->type = KDS_STMT_CREATE_TABLE;
-        ret = parse_create_table(&p, &out_stmt->create_table);
+        const kds_token_t *peek = lexer_peek(&p.lex);
+
+        if (peek->type == KDS_TOK_IDENT &&
+            strcasecmp(peek->text, "INDEX") == 0) {
+            out_stmt->type = KDS_STMT_CREATE_INDEX;
+            ret = parse_create_index(&p, &out_stmt->create_index);
+        } else {
+            out_stmt->type = KDS_STMT_CREATE_TABLE;
+            ret = parse_create_table(&p, &out_stmt->create_table);
+        }
 
     } else if (strcasecmp(tok.text, "INSERT") == 0) {
         out_stmt->type = KDS_STMT_INSERT;
@@ -660,12 +801,16 @@ int kds_parse(const char *sql, kds_stmt_t *out_stmt,
         out_stmt->type = KDS_STMT_SELECT;
         ret = parse_select(&p, &out_stmt->select);
 
+    } else if (strcasecmp(tok.text, "UPDATE") == 0) {
+        out_stmt->type = KDS_STMT_UPDATE;
+        ret = parse_update(&p, &out_stmt->update);
+
     } else if (strcasecmp(tok.text, "SHOW") == 0) {
         ret = parse_show(&p, out_stmt); /* sets out_stmt->type internally */
 
     } else {
         parser_err(&p, "unknown SQL keyword '%s' "
-                   "(supported: CREATE, INSERT, SELECT, SHOW)", tok.text);
+                   "(supported: CREATE, INSERT, SELECT, UPDATE, SHOW)", tok.text);
         ret = -EINVAL;
     }
 
@@ -694,12 +839,56 @@ int kds_parse(const char *sql, kds_stmt_t *out_stmt,
  * Utility functions
  * ------------------------------------------------------------------ */
 
+/*
+ * Encodes a parsed literal (kds_ast_val_t) into the on-disk byte form
+ * of `desc` -- the single shared path used by INSERT values, UPDATE SET
+ * values, and WHERE-clause literals. Integer literals encode from their
+ * preserved raw text so the full unsigned 64-bit range round-trips (a
+ * uint64 PK literal above S64_MAX would be lost through int_val). NULL
+ * encodes as an empty string, leaving the per-type encode() to decide
+ * what that means. Returns 0 or a negative errno.
+ */
+int kds_encode_ast_val(const kds_type_desc_t *desc, const kds_ast_val_t *val,
+                       void *buf, size_t buf_size, u16 *out_len)
+{
+    char val_str[KDS_PARSER_VAL_MAX];
+
+    if (!desc || !val)
+        return -EINVAL;
+
+    switch (val->type) {
+    case KDS_VAL_INT:
+        /* Raw literal text (exact, full-range); fall back to int_val
+         * only if no text was preserved. */
+        if (val->str_val[0]) {
+            strncpy(val_str, val->str_val, sizeof(val_str) - 1);
+            val_str[sizeof(val_str) - 1] = '\0';
+        } else {
+            scnprintf(val_str, sizeof(val_str), "%lld", (long long)val->int_val);
+        }
+        break;
+    case KDS_VAL_STR:
+        strncpy(val_str, val->str_val, sizeof(val_str) - 1);
+        val_str[sizeof(val_str) - 1] = '\0';
+        break;
+    case KDS_VAL_NULL:
+        val_str[0] = '\0';
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    return desc->encode(val_str, buf, buf_size, out_len);
+}
+
 const char *kds_stmt_type_name(kds_stmt_type_t type)
 {
     switch (type) {
     case KDS_STMT_CREATE_TABLE: return "CREATE TABLE";
+    case KDS_STMT_CREATE_INDEX: return "CREATE INDEX";
     case KDS_STMT_INSERT:       return "INSERT";
     case KDS_STMT_SELECT:       return "SELECT";
+    case KDS_STMT_UPDATE:       return "UPDATE";
     case KDS_STMT_SHOW_META:    return "SHOW META";
     case KDS_STMT_SHOW_ALLOC:   return "SHOW ALLOC";
     default:                    return "UNKNOWN";

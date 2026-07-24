@@ -51,51 +51,48 @@ void kds_relation_close(kds_relation_t *rel);
  * for an ordinary btree-clustered table -- just without any
  * sys.columns rows, since an index has no column schema of its own.
  *
- * KNOWN LIMITATION: which column the index is on is only recorded in
- * the index's name string ("index_<col>_<table_oid>"), the same
- * convention catalog.py used. There is no dedicated sys.indexes
- * catalog tracking the key column's type/oid for programmatic
- * lookup -- adding one is a follow-up, not done here.
+ * This only creates the index *relation* (btree root + sys.objects +
+ * sys.tables rows). The CREATE INDEX handler records which column it
+ * keys in a dedicated sys.indexes row (kds_catalog_insert_index_row())
+ * -- the index name still encodes the column for readability, but
+ * programmatic lookups (maintenance, planner) go through sys.indexes.
  */
 int kds_relation_create_index(kd_oid_t namespace_oid, kd_oid_t table_oid,
                                const char *target_col, kd_oid_t *out_index_oid);
 
 /*
- * Inserts (key -> value_page_id) into index_rel's btree. Thin
- * wrapper over btree_insert() (kds_btree.h).
+ * Inserts (key -> value_page_id) into index_rel's B+-tree (implemented
+ * in index_btree.c, NOT btree.c's separator B-tree). Returns 0,
+ * -EEXIST if `key` already exists (indexes are unique), or a negative
+ * errno. A root split is bounds-safe and persists the new root page id
+ * through kds_catalog_update_relation_desc_page(), also refreshing
+ * index_rel->root_page_id in place -- the old KNOWN GAP (silent root
+ * staleness / btree_propagate_split() panic) no longer applies here.
  *
- * KNOWN GAP: if this insert triggers a root split (btree_insert() ->
- * btree_propagate_split()'s new-root path), the btree's actual root
- * page_id changes, but kds_btree.c's TODO there ("Update root
- * page_id in metadata") is still unresolved -- index_rel->root_page_id
- * (and the corresponding sys.tables.desc_page_id row on disk) will
- * silently go stale, pointing at what is now a demoted INTERNAL node
- * instead of the real root. This will not be caught here; until the
- * btree layer's root-update TODO is resolved, repeated inserts that
- * cause splits can eventually make this index unreachable via
- * index_rel->root_page_id.
+ * `key` is the indexed column value widened to u64; `value_page_id` is
+ * the heap page id where the row lives (equality lookups jump to that
+ * page and scan it). Callers index integer columns only.
  */
 int kds_index_insert(kds_relation_t *index_rel, kds_tuple_id_t key,
                       kds_page_id_t value_page_id);
 
 /*
- * Looks up `key` in index_rel's btree. On success, *out_value_page_id
- * is the value stored at that key and 0 is returned. Returns -ENOENT
- * if the key isn't present.
- *
- * UNVERIFIED -- see kds_btree.c's btree_node_insert_at(): it is used
- * for both internal-node and leaf-node inserts, and stores a newly
- * inserted (key, value) pair's value at slots[pos+1] (the
- * internal-node "right child" convention), not slots[pos]. This
- * function reads a matched leaf key's value from slots[pos] -- the
- * natural reading for a leaf's own key->value association -- but
- * that has NOT been confirmed to match what btree_insert() actually
- * wrote end to end. Treat this function as unverified until tested
- * with a real insert-then-search round trip; if results come back
- * off by one position, the fix likely belongs in
- * btree_node_insert_at()'s leaf-case handling, not here.
+ * Looks up `key` in index_rel's B+-tree. On success *out_value_page_id
+ * is the value stored at that key and 0 is returned; -ENOENT if the key
+ * isn't present. Descends internal separators to the leaf and reads the
+ * matched key's value from the leaf's aligned slot[i] (the B+ leaf
+ * convention index_btree.c writes) -- the earlier off-by-one against
+ * btree.c's separator layout no longer applies.
  */
 int kds_index_search(kds_relation_t *index_rel, kds_tuple_id_t key,
                       kds_page_id_t *out_value_page_id);
+
+/*
+ * Removes `key` from index_rel's B+-tree. Returns 0, -ENOENT if absent,
+ * or a negative errno. Used by UPDATE maintenance (delete the old key
+ * before inserting the new one when an indexed column changes). Does
+ * not merge/rebalance underflowed nodes -- see index_btree.c's header.
+ */
+int kds_index_delete(kds_relation_t *index_rel, kds_tuple_id_t key);
 
 #endif /* __KDS_RELATION_H */

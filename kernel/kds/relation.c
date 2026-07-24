@@ -83,76 +83,11 @@ int kds_relation_create_index(kd_oid_t namespace_oid, kd_oid_t table_oid,
     return 0;
 }
 
-int kds_index_insert(kds_relation_t *index_rel, kds_tuple_id_t key,
-                      kds_page_id_t value_page_id)
-{
-    if (!index_rel || index_rel->kind != KDS_CLUSTERED_BTREE)
-        return -EINVAL;
-
-    return btree_insert(index_rel->root_page_id, key, value_page_id);
-}
-
-int kds_index_search(kds_relation_t *index_rel, kds_tuple_id_t key,
-                      kds_page_id_t *out_value_page_id)
-{
-    kds_page_id_t current_id;
-    kds_frame_t *frame;
-    kds_btree_node_t node;
-    int depth = 0;
-
-    if (!index_rel || !out_value_page_id || index_rel->kind != KDS_CLUSTERED_BTREE)
-        return -EINVAL;
-
-    current_id = index_rel->root_page_id;
-
-    while (depth < BTREE_MAX_DEPTH) {
-        int i, match_pos = -1;
-
-        frame = kds_buf_lookup_or_load(current_id);
-        if (IS_ERR(frame))
-            return PTR_ERR(frame);
-
-        load_btree_node(frame, &node);
-
-        for (i = 0; i < node.key_count; i++) {
-            if (node.keys[i] == key) {
-                match_pos = i;
-                break;
-            }
-        }
-
-        if (node.level == 0) {
-            /* Leaf: exact match or not found -- see this function's
-             * doc comment in kds_relation.h about the unverified
-             * slots[pos] vs slots[pos+1] question. */
-            if (match_pos < 0) {
-                kds_buf_unpin(frame);
-                return -ENOENT;
-            }
-
-            *out_value_page_id = node.slots[match_pos];
-            kds_buf_unpin(frame);
-            return 0;
-        }
-
-        /* Internal: descend via the first key >= search key, same
-         * convention btree_cursor_search()'s btree_search_position()
-         * uses. */
-        {
-            int desc_pos = node.key_count;
-
-            for (i = 0; i < node.key_count; i++) {
-                if (key <= node.keys[i]) {
-                    desc_pos = i;
-                    break;
-                }
-            }
-            current_id = node.slots[desc_pos];
-        }
-
-        kds_buf_unpin(frame);
-        depth++;
-    }
-
-    return -E2BIG; /* tree deeper than BTREE_MAX_DEPTH -- shouldn't happen */
-}
+/*
+ * kds_index_insert() / kds_index_search() / kds_index_delete() live in
+ * index_btree.c, which implements a correct, bounds-safe B+-tree for
+ * secondary indexes. They used to be thin wrappers over btree.c's
+ * separator B-tree here, but that tree's split path is unsafe as an
+ * exact key->value store (see index_btree.c's header), so index access
+ * was moved out to its own file and reimplemented.
+ */

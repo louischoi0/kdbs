@@ -7,6 +7,8 @@
 #include <linux/kds_page_alloc.h>
 #include <linux/kds_catalog.h>
 #include <linux/kds_wal.h>
+#include <linux/kds_transaction.h>
+#include <linux/kds_undo.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <linux/sched.h>
@@ -114,6 +116,19 @@ void kds_bootstrap(void)
     ret = kds_wal_checkpointer_init();
     if (ret)
         return kds_bootstrap_failed("kds_wal_checkpointer_init", ret);
+
+    /* Transaction manager: depends on the WAL (begin/commit/abort append
+     * WAL records), so it comes up after kds_wal_init(). */
+    ret = kds_txn_init();
+    if (ret)
+        return kds_bootstrap_failed("kds_txn_init", ret);
+
+    /* Undo-page manager for the UPDATE path (lazily allocates its first
+     * undo page on the first update; needs the page allocator + buffer
+     * pool, both up by now). */
+    ret = kds_undo_init();
+    if (ret)
+        return kds_bootstrap_failed("kds_undo_init", ret);
 
     pr_info("kds: bootstrap completed\n");
 
@@ -279,6 +294,15 @@ void kds_cleanup(void)
     }
 
     kds_sched_cleanup();
+
+    /*
+     * Transaction manager teardown. Safe here: every worker/load-balancer
+     * kthread that could own a transaction has already been stopped
+     * above, so nothing can begin/commit while we drop the active set.
+     * A no-op if the manager was never brought up.
+     */
+    kds_txn_shutdown();
+    kds_undo_shutdown();
 
     /*
      * Only tear down subsystems that actually finished initializing.

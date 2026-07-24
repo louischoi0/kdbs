@@ -41,6 +41,7 @@
 #include <linux/kds_executor.h>
 #include <linux/kds_wal.h>
 #include <linux/kds_relation.h>
+#include <linux/kds_index_maint.h>
 #include <linux/kds_heap.h>
 #include <linux/kds_page_mgr.h>
 #include <linux/kds_page_alloc.h>
@@ -363,6 +364,35 @@ kds_heap_insert_exec_run(kds_exec_state_t *base, u64 slice_ns)
             kds_exec_result_t r = heap_insert_run_wal_insert(exec);
             if (r != KDS_EXEC_DONE)
                 return r;
+            /*
+             * Synchronous commit: this insert's WAL record(s) are now
+             * in the ring buffer -- drain them to disk before reporting
+             * DONE, instead of waiting for the background checkpointer.
+             * Best-effort (kds_wal_sync() no-ops if WAL is unavailable),
+             * matching the "continue without WAL" stance of the WAL
+             * phases above. On-disk WAL-before-data still holds: the
+             * dirty heap frame is only flushed later by the
+             * checkpointer, after its own WAL flush.
+             */
+            kds_wal_sync();
+            /*
+             * Maintain secondary indexes now that the row is durable on
+             * its page. NOTE: index maintenance is not itself WAL-logged
+             * yet, so a crash between here and the next checkpoint can
+             * leave an index missing this row (rebuild via re-CREATE
+             * INDEX). A unique-index violation (-EEXIST) fails the INSERT
+             * but the base row already exists (no rollback -- consistent
+             * with the engine's non-atomic stance).
+             */
+            {
+                int mret = kds_index_maint_on_insert(exec->rel->oid,
+                        &exec->rel->schema, exec->data, exec->data_len,
+                        exec->wal_target_page_id);
+                if (mret) {
+                    exec->base.ret = mret;
+                    return KDS_EXEC_ERROR;
+                }
+            }
             exec->phase = KDS_HEAP_INSERT_PHASE_DONE;
             continue;
         }

@@ -11,8 +11,10 @@
  * Supported grammar:
  *
  *   CREATE TABLE <name> (<col> <type> [, ...]) [HEAP | BTREE];
+ *   CREATE INDEX <name> ON <table> (<col>);
  *   INSERT INTO  <name> VALUES (<val> [, ...]);
  *   SELECT *     FROM   <name> [WHERE <cond> [AND <cond>]*];
+ *   UPDATE <name> SET <col> = <val> [, ...] [WHERE <cond> [AND <cond>]*];
  *   SHOW META;
  *   SHOW ALLOC;
  *
@@ -135,8 +137,10 @@ typedef struct {
 
 typedef enum {
     KDS_STMT_CREATE_TABLE,
+    KDS_STMT_CREATE_INDEX,
     KDS_STMT_INSERT,
     KDS_STMT_SELECT,
+    KDS_STMT_UPDATE,
     KDS_STMT_SHOW_META,
     KDS_STMT_SHOW_ALLOC,
 } kds_stmt_type_t;
@@ -156,6 +160,19 @@ typedef struct {
     kds_clustered_type_t clustered;   /* default: KDS_CLUSTERED_HEAP */
 } kds_stmt_create_table_t;
 
+/*
+ * CREATE INDEX <index_name> ON <table_name> (<col_name>);
+ *
+ * Single-column indexes only. Semantic constraints (indexed column
+ * must be an integer type, must be unique) are enforced by the CREATE
+ * INDEX handler in dshell.c, not the parser.
+ */
+typedef struct {
+    char index_name[KDS_PARSER_NAME_MAX];
+    char table_name[KDS_PARSER_NAME_MAX];
+    char col_name[KDS_PARSER_NAME_MAX];
+} kds_stmt_create_index_t;
+
 typedef struct {
     char          table_name[KDS_PARSER_NAME_MAX];
     kds_ast_val_t values[KDS_PARSER_MAX_VALS];
@@ -170,6 +187,29 @@ typedef struct {
 } kds_stmt_select_t;
 
 /* ------------------------------------------------------------------
+ * AST: UPDATE assignment (<col> = <val>) and statement
+ *
+ * SET assignments and WHERE conditions are separate lists; the WHERE
+ * list has the exact shape SELECT uses. The engine forbids assigning
+ * to the primary-key column (column 0) -- enforced in the executor,
+ * not here.
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+    char          col_name[KDS_PARSER_NAME_MAX];
+    kds_ast_val_t val;
+} kds_ast_assign_t;
+
+typedef struct {
+    char             table_name[KDS_PARSER_NAME_MAX];
+    kds_ast_assign_t assigns[KDS_PARSER_MAX_COLS];   /* SET list */
+    u32              nr_assigns;
+    bool             has_where;
+    kds_ast_cond_t   conds[KDS_PARSER_MAX_CONDS];    /* AND-combined */
+    u32              nr_conds;
+} kds_stmt_update_t;
+
+/* ------------------------------------------------------------------
  * Top-level statement (tagged union)
  * ------------------------------------------------------------------ */
 
@@ -177,8 +217,10 @@ typedef struct {
     kds_stmt_type_t type;
     union {
         kds_stmt_create_table_t create_table;
+        kds_stmt_create_index_t create_index;
         kds_stmt_insert_t       insert;
         kds_stmt_select_t       select;
+        kds_stmt_update_t       update;
         /* show_meta / show_alloc carry no fields */
     };
 } kds_stmt_t;
@@ -201,6 +243,15 @@ typedef struct {
  */
 int kds_parse(const char *sql, kds_stmt_t *out_stmt,
               char *err_buf, size_t err_buf_size);
+
+/*
+ * kds_encode_ast_val(): encode a parsed literal into `desc`'s on-disk
+ * byte form -- the shared path for INSERT / UPDATE SET / WHERE literals.
+ * Integer literals encode from their preserved raw text, so a uint64 PK
+ * across the full 0..2^64-1 range round-trips. Returns 0 or -errno.
+ */
+int kds_encode_ast_val(const kds_type_desc_t *desc, const kds_ast_val_t *val,
+                       void *buf, size_t buf_size, u16 *out_len);
 
 /*
  * kds_stmt_type_name(): human-readable statement type, for logging.

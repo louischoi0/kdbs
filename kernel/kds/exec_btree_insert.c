@@ -35,6 +35,7 @@
 #include <linux/kds_executor.h>
 #include <linux/kds_wal.h>
 #include <linux/kds_relation.h>
+#include <linux/kds_index_maint.h>
 #include <linux/kds_heap.h>
 #include <linux/kds_btree.h>
 #include <linux/kds_page_mgr.h>
@@ -430,9 +431,33 @@ kds_btree_insert_exec_run(kds_exec_state_t *base, u64 slice_ns)
             kds_exec_result_t r;
             if (kds_exec_slice_expired(base))
                 return KDS_EXEC_CONTINUE;
+            /*
+             * All of this insert's WAL records (INIT_PAGE / INSERT /
+             * BTREE) have now been appended. Drain them to disk
+             * synchronously *before* touching the data page, so the
+             * WAL is durable ahead of the modification it describes --
+             * strict write-ahead ordering. Best-effort: kds_wal_sync()
+             * no-ops when WAL is unavailable.
+             */
+            kds_wal_sync();
             r = btree_insert_run_heap_insert(exec);
             if (r != KDS_EXEC_DONE)
                 return r;
+            /*
+             * Maintain secondary indexes for the newly-inserted row (the
+             * row's bucket page is out_tid.page_id). Not WAL-logged --
+             * same crash caveat as exec_heap_insert.c. A unique violation
+             * (-EEXIST) fails the INSERT without rolling back the base row.
+             */
+            {
+                int mret = kds_index_maint_on_insert(exec->rel->oid,
+                        &exec->rel->schema, exec->data, exec->data_len,
+                        exec->out_tid.page_id);
+                if (mret) {
+                    exec->base.ret = mret;
+                    return KDS_EXEC_ERROR;
+                }
+            }
             exec->phase = exec->need_new_page
                 ? KDS_BTREE_INSERT_PHASE_BTREE_INSERT
                 : KDS_BTREE_INSERT_PHASE_DONE;
